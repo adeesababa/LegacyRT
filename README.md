@@ -85,6 +85,12 @@ Requirements at run time: a GPU with Vulkan ray queries (RTX 20xx+, RX 6000+, re
 - **Shaders:** `shaders/compile.sh` (Vulkan SDK's `glslangValidator` and `spirv-val`).
 - **DXVK:** `dxvk/build.sh` on Linux or WSL (see its header for packages). Produces the 32-bit `d3d9.dll`.
 
+## Contributors
+
+- [adeesababa](https://github.com/adeesababa): author.
+- [mrfury97](https://github.com/mrfury97): testing on RTX hardware and the bug reports behind several fixes (among them the GPU
+  fault the arena sequence check in patch 0034 fixes, and the lamp-shadow and alpha-tested shadow fixes).
+
 ## Licence
 
 MIT (see `LICENSE`). The DXVK patches modify DXVK, which is under the zlib licence; DXVK's notices stay with its files.

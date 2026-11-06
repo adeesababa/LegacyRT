@@ -36,6 +36,23 @@ LegacyRT gets around that with three parts:
 - **Hybrid by design.** The game keeps rasterising its frame; ray tracing adds what the raster lacks. A full path tracer is
   there too, for comparison or for players with fast RTX cards.
 
+## How it differs from RTX Remix
+
+[RTX Remix](https://github.com/NVIDIAGameWorks/rtx-remix) and LegacyRT both bring ray tracing to old Direct3D 9 games, from
+opposite directions:
+
+| | RTX Remix | LegacyRT |
+|---|---|---|
+| **Approach** | Replaces the game's renderer: captures the draw calls and path-traces the whole frame itself | **Hybrid**: the game keeps rendering its own frame; ray tracing adds shadows, AO, GI and reflections (a full path tracer is optional) |
+| **What it knows about the game** | Nothing game-specific: it reads the draw stream | **Engine-aware**: a per-game feeder hands over the game's real lights, materials, actors and buffers |
+| **Best fit** | Fixed-function games (roughly pre-2004), with little per-game code | Games with their **own shaders**, where reading the draw stream alone is not enough, and mods that want to keep the game's look |
+| **Look** | Remastered: new materials and assets through its own toolkit | The game's own look, with physically correct light added |
+| **Per-game work** | Low for the games it suits | A feeder plugin per game (camera, geometry, lights, materials) |
+| **32-bit games** | Bridges the game to its own 64-bit renderer | The game and its raster stay in the 32-bit process; only the ray tracing runs in a 64-bit helper on the same GPU |
+
+Neither replaces the other: Remix is the quicker path for the games it fits; LegacyRT is for games and mods that want ray
+tracing to work *with* the original renderer rather than in place of it.
+
 ## What is in here
 
 | Folder | What |

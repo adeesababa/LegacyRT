@@ -1,0 +1,5 @@
+*.spv
+helper/bin/
+helper/obj/
+*.nvrcap
+*.f32

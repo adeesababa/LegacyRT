@@ -9,8 +9,10 @@
 // design and the pass rules: docs/next/FORK-RT-CORE.md in the NVR repository.
 //
 // Usage:
-//   NvrRtHelper.exe --shm <name>   started by NVR (never by hand)
-//   NvrRtHelper.exe --probe        prints every GPU and whether it can run the helper, then exits
+//   NvrRtHelper.exe --shm <name> [--log <file name>]   started by NVR (never by hand); --log: another log name next to the exe
+//                                  (2026-11-07 rt-shutdown: the RT test host's second helper). Every exit signals each published
+//                                  frame's "output ready" and waits for the GPU first: ShutdownDrain.
+//   NvrRtHelper.exe --probe       prints every GPU and whether it can run the helper, then exits
 //   NvrRtHelper.exe --replay <capture.nvrcap> [--shader <name>=<file.spv> ...] [--shaders <folder>] [--runs N] [--out <folder>]
 //                                  UNOFFICIAL 2026-11-03: runs one captured frame again without the game (docs/next/RT-REPLAY.md).
 //                                  A capture is written when NvrRtHelper.capture (checked every 60 frames) or NvrRtHelper.capture-at
@@ -31,6 +33,7 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstddef>
@@ -38,12 +41,18 @@
 #include <map>
 #include <string>
 #include <thread>
+#include <chrono>
 #include <unordered_map>
 #include <vector>
 
 #include "NvrRtProtocol.h"
 #include "NvrRtCapture.h"	// UNOFFICIAL 2026-11-03 frame capture / replay (claude/rt-replay)
 #include "RtArenaGuard.h"	// kRtArenaGuardSpv (RtArenaGuard.comp)
+#include "RtNormals.h"	// kRtNormalsSpv (RtNormals.comp): smooth vertex normals (2026-11-07 perf-reflfix)
+#include "RtDisplace.h"		// kRtDisplaceSpv (RtDisplace.comp; UNOFFICIAL 2026-11-07, protocol 8: NvrRtDisplace.inl)
+#include "RtOmm.h"			// kRtOmmSpv (RtOmm.comp; UNOFFICIAL 2026-11-07 ptaaa-omm, protocol 9: NvrRtOmm.inl)
+#include "RtOmmProbe.h"		// kRtOmmProbeSpv (RtOmmProbe.comp: the opacity micromaps' hardware self-test)
+#include "NvrRtOmmMath.h"	// the micromaps' curve, thresholds, levels (shared with the RT test host)
 
 namespace {
 
@@ -53,9 +62,24 @@ namespace {
 	CRITICAL_SECTION	g_logLock;
 	FILE*				g_log = nullptr;
 	NvrRtShared*		g_shared = nullptr;
+	bool g_cpuWait = false, g_highPriority = false, g_measure = false, g_calibratedExt = false;	// (2026-11-10) --wait cpu, --gpu-priority high, --measure (described at WaitSlot)
+	HANDLE g_parent = nullptr;
+	bool g_cpuSignal = false;	// (2026-11-10 --signal cpu) see RecordFrame's submit
+	int g_timerResult = -2;	// (--timer-1ms) -2 not asked, 0 set, else refused
 	HANDLE				g_statusEvent = nullptr;
 	bool				g_console = false;
 	std::wstring		g_exeDir;
+	// UNOFFICIAL 2026-11-09 (players: "shader compiling takes up to 5 minutes" since 1.0.6; docs/next/RT-PT-REVIEW-2026-11-09.md 9.2) the trace
+	// pipelines' cache on disk. Every pipeline was built from its SPIR-V at every start (44 .spv now, 22 in 1.0.5; 55 s measured on an
+	// integrated GPU, and the game waits up to 300 s for "ready"): ray tracing was simply absent for that long after every launch. The
+	// driver's compiled pipelines are now kept in NvrRtPipelines.cache next to the helper (written after the first "ready" and whenever a
+	// pipeline is built later) and handed back at the next start; the driver checks them against the GPU and its own version (the header is
+	// checked here too), so another card or a driver update just rebuilds once. A file named NvrRtPipelines.off next to the helper: no
+	// cache, exactly as before. VK_NULL_HANDLE (no cache) is what every pipeline was made with until now.
+	VkPipelineCache		g_pipelineCache = VK_NULL_HANDLE;
+	size_t				g_pipelineCacheSaved = 0;	// the size last written (0: nothing yet)
+	bool				g_pipelineCacheLive = false;	// after the first save: a pipeline built later is saved at once
+	bool				g_serialPipelines = false;	// (2026-11-11) --serial-pipelines: the start's pipelines one after another (see the start block)
 
 	void Log(const char* format, ...) {
 		char line[1024];
@@ -161,7 +185,10 @@ namespace {
 		VkPhysicalDeviceAccelerationStructurePropertiesKHR asProperties = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR };
 		VkPhysicalDeviceMemoryProperties memory = {};
 		uint32_t			timestampBits = 0;
-		const char*			matchedBy = "";	// how the game's GPU was found: "adapter LUID" / "device UUID" / "first RT GPU (probe)"
+		const char*			matchedBy = "";
+		bool				bindless = false;		// (2026-11-07, protocol 7) descriptor indexing: real textures (NvrRtTextures.inl)
+		bool				partiallyBound = false;
+		float				anisotropy = 1.0f;		// samplerAnisotropy: the device's max, 1 = off	// how the game's GPU was found: "adapter LUID" / "device UUID" / "first RT GPU (probe)"
 		PFN_vkImportSemaphoreWin32HandleKHR			importSemaphoreWin32Handle = nullptr;
 		PFN_vkCreateAccelerationStructureKHR		createAs = nullptr;
 		PFN_vkDestroyAccelerationStructureKHR		destroyAs = nullptr;
@@ -170,6 +197,13 @@ namespace {
 		PFN_vkCmdBuildAccelerationStructuresKHR		cmdBuildAs = nullptr;
 		PFN_vkCmdWriteAccelerationStructuresPropertiesKHR cmdWriteAsProperties = nullptr;	// compaction (2026-10-30)
 		PFN_vkCmdCopyAccelerationStructureKHR		cmdCopyAs = nullptr;
+		// UNOFFICIAL 2026-11-07 (ptaaa-omm, protocol 9) VK_EXT_opacity_micromap, optional (NvrRtOmm.inl): enabled where the device has it
+		bool				omm = false;
+		uint32_t			ommMaxLevel = 0;		// maxOpacity4StateSubdivisionLevel
+		PFN_vkCreateMicromapEXT			createMicromap = nullptr;
+		PFN_vkDestroyMicromapEXT		destroyMicromap = nullptr;
+		PFN_vkCmdBuildMicromapsEXT		cmdBuildMicromaps = nullptr;
+		PFN_vkGetMicromapBuildSizesEXT	micromapBuildSizes = nullptr;
 	};
 
 	// Whether a physical device can run the helper; why not in `why`.
@@ -209,6 +243,15 @@ namespace {
 		app.apiVersion = VK_API_VERSION_1_2;
 		VkInstanceCreateInfo instanceInfo = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
 		instanceInfo.pApplicationInfo = &app;
+		// (2026-11-06, NVIDIA device-lost hunt) dev switch: a file NvrRtHelper.validate next to the exe turns on the Khronos validation
+		// layer for this process only (the loader's VK_LOADER_LAYERS_ENABLE also hit the 32-bit game's DXVK, which crashed in it). Its
+		// settings (log file, GPU-assisted / sync checks) come from vk_layer_settings.txt as usual (VK_LAYER_SETTINGS_PATH or the cwd).
+		const char* validationLayer = "VK_LAYER_KHRONOS_validation";
+		if (GetFileAttributesW((g_exeDir + L"\\NvrRtHelper.validate").c_str()) != INVALID_FILE_ATTRIBUTES) {
+			instanceInfo.enabledLayerCount = 1;
+			instanceInfo.ppEnabledLayerNames = &validationLayer;
+			Log("validation: the Khronos validation layer is asked for (NvrRtHelper.validate)");
+		}
 		VK_CHECK(vkCreateInstance(&instanceInfo, nullptr, &vk.instance), "vkCreateInstance");
 
 		uint32_t count = 0;
@@ -260,14 +303,45 @@ namespace {
 		}
 		if (!found) { Status("Vulkan: no graphics + compute queue"); return false; }
 
-		const char* enabled[] = { VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, VK_KHR_RAY_QUERY_EXTENSION_NAME, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+		std::vector<const char*> enabled = { VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, VK_KHR_RAY_QUERY_EXTENSION_NAME, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
 			VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME, VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME };
 
-		VkPhysicalDeviceVulkan12Features supported12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+		// UNOFFICIAL 2026-11-07 (ptaaa-omm) VK_EXT_opacity_micromap where the device has it (RTX 40 / 50 and other drivers that expose it;
+		// it needs VK_KHR_synchronization2 under Vulkan 1.2): alpha-tested geometry's known-solid micro-triangles resolved in hardware
+		// (NvrRtOmm.inl). Missing: nothing changes (the shaders' alpha test as before).
+		VkPhysicalDeviceOpacityMicromapFeaturesEXT ommSupported = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT };
+		bool ommExt = false, sync2Ext = false;
+		{
+			uint32_t n = 0;
+			vkEnumerateDeviceExtensionProperties(vk.physical, nullptr, &n, nullptr);
+			std::vector<VkExtensionProperties> exts(n);
+			vkEnumerateDeviceExtensionProperties(vk.physical, nullptr, &n, exts.data());
+			ommExt = HasExtension(exts, VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
+			sync2Ext = HasExtension(exts, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+		}
+
+		VkPhysicalDeviceVulkan12Features supported12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, ommExt ? &ommSupported : nullptr };
 		VkPhysicalDeviceFeatures2 supported = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &supported12 };
 		vkGetPhysicalDeviceFeatures2(vk.physical, &supported);
+		vk.omm = ommExt && sync2Ext && ommSupported.micromap == VK_TRUE;
+		if (vk.omm) {
+			VkPhysicalDeviceOpacityMicromapPropertiesEXT ommProps = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_PROPERTIES_EXT };
+			VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &ommProps };
+			vkGetPhysicalDeviceProperties2(vk.physical, &p2);
+			vk.ommMaxLevel = ommProps.maxOpacity4StateSubdivisionLevel;
+			vk.omm = vk.ommMaxLevel > 0;
+		}
+		if (vk.omm) {
+			enabled.push_back(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
+			enabled.push_back(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+		}
+		Log("opacity micromaps: VK_EXT_opacity_micromap %s, VK_KHR_synchronization2 %s, feature micromap %s, max 4-state subdivision level %u: %s",
+			ommExt ? "yes" : "no", sync2Ext ? "yes" : "no", ommSupported.micromap ? "yes" : "no", vk.ommMaxLevel,
+			vk.omm ? "enabled (alpha-tested geometry can get micromaps: NvrRtOmm.inl)" : "not available (the shaders' alpha test as before)");
 
-		VkPhysicalDeviceRayQueryFeaturesKHR rq = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR };
+		VkPhysicalDeviceOpacityMicromapFeaturesEXT ommEnable = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT };
+		ommEnable.micromap = VK_TRUE;
+		VkPhysicalDeviceRayQueryFeaturesKHR rq = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR, vk.omm ? &ommEnable : nullptr };
 		rq.rayQuery = VK_TRUE;
 		VkPhysicalDeviceAccelerationStructureFeaturesKHR as = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR, &rq };
 		as.accelerationStructure = VK_TRUE;
@@ -276,23 +350,60 @@ namespace {
 		features12.bufferDeviceAddress = VK_TRUE;
 		features12.hostQueryReset = supported12.hostQueryReset;
 		features12.descriptorBindingPartiallyBound = supported12.descriptorBindingPartiallyBound;
+		// (2026-11-07, protocol 7) real textures: an array of the game's textures, written while earlier frames are in flight
+		features12.runtimeDescriptorArray = supported12.runtimeDescriptorArray;
+		features12.shaderSampledImageArrayNonUniformIndexing = supported12.shaderSampledImageArrayNonUniformIndexing;
+		features12.descriptorBindingSampledImageUpdateAfterBind = supported12.descriptorBindingSampledImageUpdateAfterBind;
+		features12.descriptorBindingUpdateUnusedWhilePending = supported12.descriptorBindingUpdateUnusedWhilePending;
+		vk.partiallyBound = supported12.descriptorBindingPartiallyBound == VK_TRUE;
+		vk.bindless = vk.partiallyBound && supported12.shaderSampledImageArrayNonUniformIndexing && supported12.descriptorBindingSampledImageUpdateAfterBind &&
+			supported12.descriptorBindingUpdateUnusedWhilePending;
 		VkPhysicalDeviceFeatures2 features = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features12 };
 		features.features.shaderStorageImageExtendedFormats = supported.features.shaderStorageImageExtendedFormats;
 		features.features.shaderStorageImageWriteWithoutFormat = supported.features.shaderStorageImageWriteWithoutFormat;
 		features.features.shaderStorageImageReadWithoutFormat = supported.features.shaderStorageImageReadWithoutFormat;
 		features.features.shaderInt64 = supported.features.shaderInt64;
+		features.features.samplerAnisotropy = supported.features.samplerAnisotropy;
+		features.features.shaderSampledImageArrayDynamicIndexing = supported.features.shaderSampledImageArrayDynamicIndexing;
 
 		float priority = 1.0f;
 		VkDeviceQueueCreateInfo queueInfo = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
 		queueInfo.queueFamilyIndex = vk.queueFamily;
 		queueInfo.queueCount = 1;
 		queueInfo.pQueuePriorities = &priority;
+		// UNOFFICIAL 2026-11-10 --gpu-priority high / --measure (the extensions looked up again: the list above is out of scope here)
+		VkDeviceQueueGlobalPriorityCreateInfoEXT globalPriority = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT };
+		globalPriority.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_HIGH_EXT;
+		const char* priorityExtension = nullptr;
+		{
+			uint32_t n = 0;
+			vkEnumerateDeviceExtensionProperties(vk.physical, nullptr, &n, nullptr);
+			std::vector<VkExtensionProperties> exts(n);
+			vkEnumerateDeviceExtensionProperties(vk.physical, nullptr, &n, exts.data());
+			if (g_highPriority) {
+				if (HasExtension(exts, "VK_KHR_global_priority")) priorityExtension = "VK_KHR_global_priority";
+				else if (HasExtension(exts, "VK_EXT_global_priority")) priorityExtension = "VK_EXT_global_priority";
+				if (priorityExtension) { enabled.push_back(priorityExtension); queueInfo.pNext = &globalPriority; }
+				else Log("GPU priority: the driver offers no global queue priority (VK_KHR/EXT_global_priority); the queue stays at the default");
+			}
+			if (g_measure && HasExtension(exts, "VK_EXT_calibrated_timestamps")) { enabled.push_back("VK_EXT_calibrated_timestamps"); g_calibratedExt = true; }
+		}
 		VkDeviceCreateInfo deviceInfo = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &features };
 		deviceInfo.queueCreateInfoCount = 1;
 		deviceInfo.pQueueCreateInfos = &queueInfo;
-		deviceInfo.enabledExtensionCount = (uint32_t)(sizeof(enabled) / sizeof(enabled[0]));
-		deviceInfo.ppEnabledExtensionNames = enabled;
-		VK_CHECK(vkCreateDevice(vk.physical, &deviceInfo, nullptr, &vk.device), "vkCreateDevice");
+		deviceInfo.enabledExtensionCount = (uint32_t)enabled.size();
+		deviceInfo.ppEnabledExtensionNames = enabled.data();
+		{
+			VkResult created = vkCreateDevice(vk.physical, &deviceInfo, nullptr, &vk.device);
+			if (priorityExtension && created == VK_ERROR_NOT_PERMITTED_EXT) {
+				Log("GPU priority: %s HIGH is not permitted here; the queue stays at the default", priorityExtension);
+				queueInfo.pNext = nullptr; priorityExtension = nullptr;
+				created = vkCreateDevice(vk.physical, &deviceInfo, nullptr, &vk.device);
+			}
+			VK_CHECK(created, "vkCreateDevice");
+			if (priorityExtension) Log("GPU priority: the queue is at %s HIGH", priorityExtension);
+		}
+		if (supported.features.samplerAnisotropy) vk.anisotropy = vk.properties.limits.maxSamplerAnisotropy;
 		vkGetDeviceQueue(vk.device, vk.queueFamily, 0, &vk.queue);
 		vk.importSemaphoreWin32Handle = (PFN_vkImportSemaphoreWin32HandleKHR)vkGetDeviceProcAddr(vk.device, "vkImportSemaphoreWin32HandleKHR");
 		vk.createAs = (PFN_vkCreateAccelerationStructureKHR)vkGetDeviceProcAddr(vk.device, "vkCreateAccelerationStructureKHR");
@@ -305,6 +416,16 @@ namespace {
 		if (!vk.importSemaphoreWin32Handle || !vk.createAs || !vk.destroyAs || !vk.buildSizes || !vk.asAddress || !vk.cmdBuildAs) {
 			Status("Vulkan: entry points missing");
 			return false;
+		}
+		if (vk.omm) {	// (2026-11-07, ptaaa-omm)
+			vk.createMicromap = (PFN_vkCreateMicromapEXT)vkGetDeviceProcAddr(vk.device, "vkCreateMicromapEXT");
+			vk.destroyMicromap = (PFN_vkDestroyMicromapEXT)vkGetDeviceProcAddr(vk.device, "vkDestroyMicromapEXT");
+			vk.cmdBuildMicromaps = (PFN_vkCmdBuildMicromapsEXT)vkGetDeviceProcAddr(vk.device, "vkCmdBuildMicromapsEXT");
+			vk.micromapBuildSizes = (PFN_vkGetMicromapBuildSizesEXT)vkGetDeviceProcAddr(vk.device, "vkGetMicromapBuildSizesEXT");
+			if (!vk.createMicromap || !vk.destroyMicromap || !vk.cmdBuildMicromaps || !vk.micromapBuildSizes) {
+				Log("opacity micromaps: the extension's entry points are missing: off");
+				vk.omm = false;
+			}
 		}
 		Log("device: %s, max %llu instances, %llu triangles a geometry, scratch alignment %u", vk.properties.deviceName,
 			(unsigned long long)vk.asProperties.maxInstanceCount, (unsigned long long)vk.asProperties.maxPrimitiveCount,
@@ -431,7 +552,14 @@ namespace {
 		bool						dynamic = false;				// built with ALLOW_UPDATE: later frames refit it in place
 		bool						compacted = false;
 		uint32_t					opFlags = 0;					// UNOFFICIAL 2026-11-03: NVR_RT_OP_FLAG_* of its build (the capture rebuilds it the same way)
+		// UNOFFICIAL 2026-11-07 (perf-reflfix) smooth vertex normals: `vertices` words just BEFORE vertexOffset (allocated with the data:
+		// the block starts at vertexOffset - normalWords), one packed normal a vertex (RtNormals.comp); normalsReady once packed. The
+		// records of instances traced through it carry NVR_RT_RECORD_GEO_NORMALS in their geometryId (NvrRtProtocol.h).
+		uint32_t					normalWords = 0;
+		bool						normalsReady = false;
 	};
+	// The geometry data words a geometry owns (its normals block first)
+	inline uint32_t DataBase(const Geometry& g) { return g.vertexOffset == NVR_RT_NO_DATA ? NVR_RT_NO_DATA : g.vertexOffset - g.normalWords; }
 
 	// The geometry data's words: first fit.
 	struct WordPool {
@@ -582,6 +710,8 @@ namespace {
 
 	struct Slot {
 		VkCommandBuffer	cmd = VK_NULL_HANDLE;
+		int64_t			tWake = 0, tSubmit = 0, tOutSeen = 0, tFenceSeen = 0;
+		VkFence			fence = VK_NULL_HANDLE;	// (2026-11-10 --measure / --signal cpu) this slot's submission's fence	// (2026-11-10 --measure) QPC ticks of this slot's frame
 		uint64_t		frame = 0;			// the frame last submitted from this slot (0 = none)
 		Buffer			instances;			// host-visible VkAccelerationStructureInstanceKHR[NVR_RT_MAX_INSTANCES]
 		Buffer			constants;			// host-visible, NVR_RT_PASS_CONSTANTS per pass
@@ -627,11 +757,41 @@ namespace {
 
 	struct PendingFree { uint64_t frame; Geometry geometry; };
 
+	// (2026-11-07, protocol 7) real textures (NvrRtTextures.inl)
+	struct RealTexture { VkImage image = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; VkDeviceSize bytes = 0;
+		uint32_t width = 0, height = 0, levels = 0;
+		uint64_t serial = 0; };	// (2026-11-07, ptaaa-omm) a new one each upload: a micromap made from a texture is stale once its id holds another
+	struct PendingTextureFree { uint64_t frame; RealTexture texture; };
+	struct RealTextures {
+		VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+		VkDescriptorPool	pool = VK_NULL_HANDLE;
+		VkDescriptorSet		sets[kCmdRing] = {};	// set 1, one per command slot (its own table)
+		VkSampler			sampler = VK_NULL_HANDLE;
+		Buffer				tables[kCmdRing];		// host visible uvec4[NVR_RT_TEX_TABLE_SLOTS]: this slot's copy of `table`
+		Buffer				uploads[kCmdRing];		// host visible, a staging region's size: the frame's texture bytes
+		uint32_t			table[NVR_RT_TEX_TABLE_SLOTS][4] = {};
+		std::vector<RealTexture> textures;			// by id
+		std::vector<PendingTextureFree> frees;
+		const uint8_t*		staging = nullptr;		// the "<base>-tex" block (read only)
+		uint32_t			stagingRegion = 0;		// bytes a frame ring slot
+		std::vector<uint8_t> bytes;					// this frame's texture bytes, copied out before consumedFrame
+		std::vector<uint32_t> offsets;				// per op: where its bytes start in `bytes` (~0: none)
+		uint64_t			alive = 0, aliveBytes = 0, uploaded = 0, refused = 0;
+		uint64_t			serials = 0;				// (2026-11-07, ptaaa-omm) RealTexture::serial's counter
+		bool				loggedFirst = false;
+		struct GpuCopy { VkImage src, dst; std::vector<VkImageCopy> regions; };
+		std::vector<GpuCopy> gpuCopies;				// this frame's copies out of the transfer image (bytes 0 ops)
+	};
+
 	struct Helper {
 		VulkanDevice	vk;
+		VkResult (VKAPI_PTR* getCalibrated)(VkDevice, uint32_t, const VkCalibratedTimestampInfoEXT*, uint64_t*, uint64_t*) = nullptr;	// (--measure)
+		double			mWakeToSubmit = 0, mSubmitToStart = 0, mWork = 0, mEndToSeen = 0, mSubmitToStartMax = 0, mEndToSeenMax = 0; uint32_t mCount = 0;
+		double			mEndToFence = 0, mEndToFenceMax = 0;
 		SharedImage		images[NVR_RT_MAX_IMAGES];
 		uint32_t		imageCount = 0;
 		VkSemaphore		inputsReady = VK_NULL_HANDLE, outputReady = VK_NULL_HANDLE;
+		uint64_t		lastSubmitted = 0;	// (2026-11-07 rt-shutdown) the last frame whose submission went out (it signals outputReady = that)
 		VkCommandPool	pool = VK_NULL_HANDLE;
 		VkQueryPool		queries = VK_NULL_HANDLE;
 		Slot			slots[kCmdRing];
@@ -642,6 +802,8 @@ namespace {
 		VkDeviceSize	tlasScratch = 0;
 		StructurePool	structures;
 		Buffer			geometryData;		// binding 11
+		Buffer			scratchStore;		// (2026-11-07, protocol 6) binding 20: the passes' own state, zero at start, kept between frames
+		bool			scratchCleared = false;
 		WordPool		dataWords;
 		std::unordered_map<uint32_t, Geometry> geometries;
 		std::vector<PendingFree> pendingFrees;
@@ -657,11 +819,18 @@ namespace {
 		uint64_t		passUs[NVR_RT_MAX_SHADERS] = {};		// per shader: GPU time of its passes, summed until the next report
 		uint32_t		passRuns[NVR_RT_MAX_SHADERS] = {};
 		uint64_t		refits = 0, fullBuilds = 0;	// dynamic (actor) geometry: in-place updates / full builds
+		uint64_t		duplicateBuilds = 0;		// (2026-11-06) BUILD ops skipped: a later op for the same id this frame
 		VkQueryPool		compactQueries = VK_NULL_HANDLE;	// compacted sizes, kCompactPerSlot a slot (2026-10-30)
 		// The arena guard (RtArenaGuard.comp, 2026-10-30): indices clamped before every build; a stale arena (sequence texel) emptied
 		VkPipelineLayout guardLayout = VK_NULL_HANDLE;
 		VkPipeline		guardPipeline = VK_NULL_HANDLE;
 		Buffer			guardResult;		// 2 uints a slot, host visible: [0] stale indices, [1] out-of-range indices
+		// UNOFFICIAL 2026-11-07 (perf-reflfix) the smooth vertex normals (RtNormals.comp): geometries waiting for theirs (static ones the
+		// frame's budget left over), and what was made (logged every 600 frames)
+		VkPipelineLayout normalsLayout = VK_NULL_HANDLE;
+		VkPipeline		normalsPipeline = VK_NULL_HANDLE;
+		std::vector<uint32_t> normalsWaiting;
+		uint64_t		normalsMade = 0, normalsRefreshed = 0, normalsVertices = 0, normalsNoRoom = 0;
 		uint64_t		staleFrames = 0, rangeFrames = 0;
 		bool			toldStale = false, toldRange = false;
 		std::vector<CompactReady> compactReady;		// sizes read back, copied at the next frame
@@ -674,15 +843,25 @@ namespace {
 		bool			probeDone = false;
 		Capture			capture;			// UNOFFICIAL 2026-11-03 (claude/rt-replay): one frame's inputs to a file on request
 		NvrRtFrame		frame;				// this frame's record, copied out of the ring (2 MB: on the heap via Helper)
+		RealTextures	tex;				// (2026-11-07, protocol 7) set 1: the game's own textures
 	};
 
+#include "NvrRtTextures.inl"	// UNOFFICIAL 2026-11-07 (protocol 7) real textures: set 1
+
+	// UNOFFICIAL 2026-11-10 (experiment, measured through the capture replay): the scene's top level is rebuilt every frame; with
+	// NVR_RT_TLAS_FAST_TRACE in the environment it is built for tracing speed (PREFER_FAST_TRACE) instead of build speed. One function:
+	// the size query, the live build and the replay's build must ask with the same flags.
+	VkBuildAccelerationStructureFlagsKHR TlasBuildFlags() {
+		static const bool fastTrace = getenv("NVR_RT_TLAS_FAST_TRACE") != nullptr;
+		return fastTrace ? VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR : VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+	}
 	bool CreateTlas(Helper& h) {
 		VkAccelerationStructureGeometryKHR geometry = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
 		geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
 		geometry.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
 		VkAccelerationStructureBuildGeometryInfoKHR build = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
 		build.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
-		build.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+		build.flags = TlasBuildFlags();
 		build.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
 		build.geometryCount = 1;
 		build.pGeometries = &geometry;
@@ -710,9 +889,9 @@ namespace {
 	}
 
 	bool CreatePipelineLayout(Helper& h) {
-		const uint32_t bindingCount = 2 + NVR_RT_PASS_IMAGES_MAX + 2;
-		VkDescriptorSetLayoutBinding bindings[2 + NVR_RT_PASS_IMAGES_MAX + 2] = {};
-		VkDescriptorBindingFlags flags[2 + NVR_RT_PASS_IMAGES_MAX + 2] = {};
+		const uint32_t bindingCount = 2 + NVR_RT_PASS_IMAGES_MAX + 3;
+		VkDescriptorSetLayoutBinding bindings[2 + NVR_RT_PASS_IMAGES_MAX + 3] = {};
+		VkDescriptorBindingFlags flags[2 + NVR_RT_PASS_IMAGES_MAX + 3] = {};
 		bindings[0] = { 0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 		bindings[1] = { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 		for (uint32_t i = 0; i < NVR_RT_PASS_IMAGES_MAX; i++) {	// images 0..7 at 2..9, 8..11 at 12..15 (records / geometry stay 10 / 11)
@@ -722,6 +901,7 @@ namespace {
 		}
 		bindings[2 + NVR_RT_PASS_IMAGES] = { NVR_RT_BINDING_RECORDS, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 		bindings[3 + NVR_RT_PASS_IMAGES] = { NVR_RT_BINDING_GEOMETRY, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+		bindings[2 + NVR_RT_PASS_IMAGES_MAX + 2] = { NVR_RT_BINDING_SCRATCH, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };	// (protocol 6)
 		VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlags = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO };
 		bindingFlags.bindingCount = bindingCount;
 		bindingFlags.pBindingFlags = flags;
@@ -729,16 +909,18 @@ namespace {
 		setInfo.bindingCount = bindingCount;
 		setInfo.pBindings = bindings;
 		VK_CHECK(vkCreateDescriptorSetLayout(h.vk.device, &setInfo, nullptr, &h.setLayout), "vkCreateDescriptorSetLayout");
+		if (!RealTex::Create(h)) return false;	// (2026-11-07, protocol 7) set 1: real textures
+		const VkDescriptorSetLayout setLayouts[2] = { h.setLayout, h.tex.layout };
 		VkPipelineLayoutCreateInfo layoutInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-		layoutInfo.setLayoutCount = 1;
-		layoutInfo.pSetLayouts = &h.setLayout;
+		layoutInfo.setLayoutCount = 2;
+		layoutInfo.pSetLayouts = setLayouts;
 		VK_CHECK(vkCreatePipelineLayout(h.vk.device, &layoutInfo, nullptr, &h.pipelineLayout), "vkCreatePipelineLayout");
 		const uint32_t sets = kCmdRing * NVR_RT_MAX_PASSES;
 		VkDescriptorPoolSize sizes[4] = {
 			{ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, sets },
 			{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, sets },
 			{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, sets * NVR_RT_PASS_IMAGES_MAX },
-			{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, sets * 2 } };
+			{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, sets * 3 } };
 		VkDescriptorPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
 		poolInfo.maxSets = sets;
 		poolInfo.poolSizeCount = 4;
@@ -756,12 +938,60 @@ namespace {
 		return true;
 	}
 
-	// The pipeline of shader `index` (loaded from NVR's path on first use; a failure is logged once and skips its passes).
-	VkPipeline Pipeline(Helper& h, uint32_t index) {
-		if (index >= NVR_RT_MAX_SHADERS || index >= g_shared->shaderCount) return VK_NULL_HANDLE;
-		if (h.pipelines.size() <= index) { h.pipelines.resize(index + 1, VK_NULL_HANDLE); h.pipelineTried.resize(index + 1, false); }
-		if (h.pipelineTried[index]) return h.pipelines[index];
-		h.pipelineTried[index] = true;
+	// (2026-11-09) the pipeline cache: made from the file when its header is this GPU's and driver's (else empty); see g_pipelineCache
+	void PipelineCacheOpen(const VulkanDevice& vk) {
+		const std::wstring off = g_exeDir + L"\\NvrRtPipelines.off";
+		if (GetFileAttributesW(off.c_str()) != INVALID_FILE_ATTRIBUTES) { Log("pipeline cache: off (NvrRtPipelines.off exists): every pipeline is built from its SPIR-V"); return; }
+		std::vector<uint8_t> data;
+		FILE* f = nullptr;
+		if (_wfopen_s(&f, (g_exeDir + L"\\NvrRtPipelines.cache").c_str(), L"rb") == 0 && f) {
+			fseek(f, 0, SEEK_END); const long n = ftell(f); fseek(f, 0, SEEK_SET);
+			if (n > 32 && n < (64 << 20)) { data.resize((size_t)n); if (fread(data.data(), 1, data.size(), f) != data.size()) data.clear(); }
+			fclose(f);
+		}
+		bool usable = false;
+		if (data.size() > 32) {	// VkPipelineCacheHeaderVersionOne: size, version, vendor, device, the driver's cache UUID
+			uint32_t head[4]; memcpy(head, data.data(), 16);
+			usable = head[0] == 32u && head[1] == (uint32_t)VK_PIPELINE_CACHE_HEADER_VERSION_ONE && head[2] == vk.properties.vendorID &&
+				head[3] == vk.properties.deviceID && memcmp(data.data() + 16, vk.properties.pipelineCacheUUID, VK_UUID_SIZE) == 0;
+		}
+		VkPipelineCacheCreateInfo info = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+		if (usable) { info.initialDataSize = data.size(); info.pInitialData = data.data(); }
+		if (vkCreatePipelineCache(vk.device, &info, nullptr, &g_pipelineCache) != VK_SUCCESS) {
+			g_pipelineCache = VK_NULL_HANDLE;
+			if (usable) { info.initialDataSize = 0; info.pInitialData = nullptr; if (vkCreatePipelineCache(vk.device, &info, nullptr, &g_pipelineCache) != VK_SUCCESS) g_pipelineCache = VK_NULL_HANDLE; usable = false; }
+		}
+		g_pipelineCacheSaved = usable ? data.size() : 0;
+		Log("pipeline cache: %s", !g_pipelineCache ? "could not be made: every pipeline is built from its SPIR-V" : usable ? "loaded from NvrRtPipelines.cache" :
+			data.empty() ? "empty (no file yet): this start builds every pipeline and saves them" : "the file is another GPU's or driver's: this start builds every pipeline and saves them");
+		if (usable) Log("pipeline cache: %u KB read", (unsigned)(data.size() >> 10));
+	}
+
+	// Written to a temporary file and moved over the old one (a helper stopped mid-write leaves the old file whole). when: for the log.
+	void PipelineCacheSave(VkDevice device, const char* when) {
+		if (!g_pipelineCache) return;
+		size_t size = 0;
+		if (vkGetPipelineCacheData(device, g_pipelineCache, &size, nullptr) != VK_SUCCESS || size <= 32 || size == g_pipelineCacheSaved) { g_pipelineCacheLive = true; return; }
+		std::vector<uint8_t> data(size);
+		if (vkGetPipelineCacheData(device, g_pipelineCache, &size, data.data()) != VK_SUCCESS) { g_pipelineCacheLive = true; return; }
+		const std::wstring path = g_exeDir + L"\\NvrRtPipelines.cache", temp = path + L".tmp";
+		FILE* f = nullptr;
+		bool ok = _wfopen_s(&f, temp.c_str(), L"wb") == 0 && f;
+		if (ok) { ok = fwrite(data.data(), 1, size, f) == size; fclose(f); }
+		ok = ok && MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+		if (ok) g_pipelineCacheSaved = size;
+		g_pipelineCacheLive = true;
+		Log("pipeline cache: %s (%u KB, %s)", ok ? "saved" : "could NOT be written next to the helper (the next start builds the pipelines again)", (unsigned)(size >> 10), when);
+	}
+
+	// UNOFFICIAL 2026-11-11 (docs/next/RT-HELPER-STARTUP-2026-11-11.md, change A) the build of shader `index`'s pipeline, shared by
+	// Pipeline() below and the start's worker threads (RunHelper). Thread safe: it reads the SPIR-V into its own buffer, makes its own module
+	// and calls vkCreateComputePipelines with g_pipelineCache, which PipelineCacheOpen made with flags 0 (no EXTERNALLY_SYNCHRONIZED bit: the
+	// driver synchronises it), and h.pipelineLayout, made before and only read. It logs "loaded" (Log takes g_logLock) and writes nothing
+	// else that is shared: no Status(), no shaderFailures bit, no cache save, no h.pipelines / h.pipelineTried. A failure returns null with
+	// its status line (the same text as before) in `failure`; the caller writes it with Status() and sets the shader's failure bit.
+	VkPipeline BuildPipeline(Helper& h, uint32_t index, std::string& failure) {
+		char line[512];
 		char path[261] = {};
 		memcpy(path, g_shared->shaderPaths[index], 260);
 		FILE* f = nullptr;
@@ -774,8 +1004,8 @@ namespace {
 			fclose(f);
 		}
 		if (code.empty() || code[0] != 0x07230203u) {
-			Status("trace shader %u: cannot read SPIR-V from %s", index, path);
-			InterlockedOr((volatile LONG*)&g_shared->shaderFailures, (LONG)(1u << index));
+			snprintf(line, sizeof(line), "trace shader %u: cannot read SPIR-V from %s", index, path);
+			failure = line;
 			return VK_NULL_HANDLE;
 		}
 		VkShaderModuleCreateInfo moduleInfo = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
@@ -791,40 +1021,125 @@ namespace {
 			info.stage.module = module;
 			info.stage.pName = "main";
 			info.layout = h.pipelineLayout;
-			r = vkCreateComputePipelines(h.vk.device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
+			r = vkCreateComputePipelines(h.vk.device, g_pipelineCache, 1, &info, nullptr, &pipeline);
 			vkDestroyShaderModule(h.vk.device, module, nullptr);
 		}
 		if (r != VK_SUCCESS) {
-			Status("trace shader %u (%s): pipeline creation failed: %s", index, path, VkResultName(r));
-			InterlockedOr((volatile LONG*)&g_shared->shaderFailures, (LONG)(1u << index));
+			snprintf(line, sizeof(line), "trace shader %u (%s): pipeline creation failed: %s", index, path, VkResultName(r));
+			failure = line;
 			return VK_NULL_HANDLE;
 		}
 		Log("trace shader %u loaded: %s", index, path);
+		return pipeline;
+	}
+
+	// The pipeline of shader `index` (loaded from NVR's path on first use; a failure is logged once and skips its passes).
+	VkPipeline Pipeline(Helper& h, uint32_t index) {
+		if (index >= NVR_RT_MAX_SHADERS || index >= g_shared->shaderCount) return VK_NULL_HANDLE;
+		if (h.pipelines.size() <= index) { h.pipelines.resize(index + 1, VK_NULL_HANDLE); h.pipelineTried.resize(index + 1, false); }
+		if (h.pipelineTried[index]) return h.pipelines[index];
+		h.pipelineTried[index] = true;
+		std::string failure;
+		const VkPipeline pipeline = BuildPipeline(h, index, failure);
+		if (!failure.empty()) {
+			Status("%s", failure.c_str());
+			InterlockedOr((volatile LONG*)&g_shared->shaderFailures, (LONG)(1u << index));
+			return VK_NULL_HANDLE;
+		}
+		if (g_pipelineCacheLive) PipelineCacheSave(h.vk.device, "a shader registered after the start");
 		h.pipelines[index] = pipeline;
 		return pipeline;
 	}
 
 	// Frees geometries whose last possible user (a frame in flight) has finished.
 	void ReleaseFinished(Helper& h) {
-		if (h.pendingFrees.empty()) return;
+		if (h.pendingFrees.empty() && h.tex.frees.empty()) return;
 		uint64_t done = 0;
 		vkGetSemaphoreCounterValue(h.vk.device, h.outputReady, &done);
+		RealTex::ReleaseFinished(h, done);	// (2026-11-07, protocol 7)
 		auto it = std::remove_if(h.pendingFrees.begin(), h.pendingFrees.end(), [&](const PendingFree& p) {
 			if (p.frame > done) return false;
-			h.vk.destroyAs(h.vk.device, p.geometry.as, nullptr);
-			h.structures.Free(h.vk, p.geometry.block, p.geometry.offset, p.geometry.size);
-			h.dataWords.Free(p.geometry.vertexOffset, p.geometry.dataWords);
+			if (p.geometry.as) {	// (2026-11-07, protocol 8: a DATA id's words have no structure)
+				h.vk.destroyAs(h.vk.device, p.geometry.as, nullptr);
+				h.structures.Free(h.vk, p.geometry.block, p.geometry.offset, p.geometry.size);
+			}
+			h.dataWords.Free(DataBase(p.geometry), p.geometry.dataWords + p.geometry.normalWords);	// (2026-11-07 perf-reflfix: with the normals block)
 			return true;
 		});
 		h.pendingFrees.erase(it, h.pendingFrees.end());
 	}
 
+	namespace Displace { void DropCopiesOf(Helper& h, uint32_t id, uint64_t frame); }	// NvrRtDisplace.inl (2026-11-07, protocol 8)
+	namespace Omm { void DropFor(Helper& h, uint32_t id, uint64_t frame); }	// NvrRtOmm.inl (2026-11-07 ptaaa-omm, protocol 9)
+
 	void ReleaseGeometry(Helper& h, uint32_t id, uint64_t frame) {
+		Displace::DropCopiesOf(h, id, frame);	// its displaced copies (built from the old data) go with it
+		Omm::DropFor(h, id, frame);	// (2026-11-07 ptaaa-omm) and its micromap structures
 		auto it = h.geometries.find(id);
 		if (it == h.geometries.end()) return;
 		h.triangles -= it->second.triangles;
 		h.pendingFrees.push_back({ frame, it->second });	// frames up to this one may still trace it
 		h.geometries.erase(it);
+	}
+
+	// UNOFFICIAL 2026-11-07 (perf-reflfix) the smooth vertex normals (RtNormals.comp) of the geometries in `now` (built or posed this frame)
+	// and of static ones still waiting: one accumulator for all of them from the geometry data (freed once the frame is done), ACCUMULATE
+	// per geometry, then PACK into each one's normals block. At most kNormalsBudget vertices a frame (a cell's load builds thousands of
+	// meshes at once); static geometry over it waits for the next frames, posed actors simply keep last frame's normals.
+	void MakeNormals(Helper& h, VkCommandBuffer cmd, const std::vector<uint32_t>& now, uint64_t frame) {
+		if (!h.normalsPipeline || (now.empty() && h.normalsWaiting.empty())) return;
+		const uint32_t kNormalsBudget = 1u << 20;
+		struct Job { uint32_t id; Geometry* g; uint32_t acc; };
+		std::vector<Job> jobs;
+		std::vector<uint32_t> waiting;
+		uint32_t vertices = 0;
+		std::unordered_map<uint32_t, bool> taken;
+		auto consider = [&](uint32_t id) {
+			auto it = h.geometries.find(id);
+			if (it == h.geometries.end() || !it->second.normalWords || it->second.vertexOffset == NVR_RT_NO_DATA || it->second.indexOffset == NVR_RT_NO_DATA) return;
+			if (!taken.emplace(id, true).second) return;
+			Geometry& g = it->second;
+			if (!jobs.empty() && vertices + g.vertices > kNormalsBudget) {
+				if (!g.dynamic || !g.normalsReady) waiting.push_back(id);	// (a posed actor with normals keeps them a frame)
+				return;
+			}
+			jobs.push_back({ id, &g, vertices });
+			vertices += g.vertices;
+		};
+		for (uint32_t id : h.normalsWaiting) consider(id);
+		for (uint32_t id : now) consider(id);
+		h.normalsWaiting.swap(waiting);
+		if (jobs.empty()) return;
+		uint32_t acc = h.dataWords.Allocate(3u * vertices);
+		if (acc == NVR_RT_NO_DATA) {	// no room for the accumulator: everything waits (static) or keeps its old normals (posed)
+			h.normalsNoRoom++;
+			for (const Job& j : jobs) if (!j.g->dynamic || !j.g->normalsReady) h.normalsWaiting.push_back(j.id);
+			return;
+		}
+		vkCmdFillBuffer(cmd, h.geometryData.buffer, (VkDeviceSize)acc * 4, (VkDeviceSize)vertices * 12, 0);
+		FullBarrier(cmd);
+		struct { uint64_t data; uint32_t vertexOffset, indexOffset, normalOffset, accOffset, vertices, triangles, mode; } push = {};
+		push.data = h.geometryData.address;
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, h.normalsPipeline);
+		for (uint32_t mode = 0; mode < 2; mode++) {
+			for (const Job& j : jobs) {
+				const Geometry& g = *j.g;
+				push.vertexOffset = g.vertexOffset; push.indexOffset = g.indexOffset; push.normalOffset = g.vertexOffset - g.normalWords;
+				push.accOffset = acc + 3u * j.acc; push.vertices = g.vertices; push.triangles = g.triangles; push.mode = mode;
+				vkCmdPushConstants(cmd, h.normalsLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+				vkCmdDispatch(cmd, ((mode ? g.vertices : g.triangles) + 63u) / 64u, 1u, 1u);
+			}
+			FullBarrier(cmd);
+		}
+		for (const Job& j : jobs) {
+			if (j.g->normalsReady) h.normalsRefreshed++; else h.normalsMade++;
+			j.g->normalsReady = true;
+		}
+		h.normalsVertices += vertices;
+		Geometry temp;	// the accumulator's words: freed once this frame's commands are done
+		temp.vertexOffset = acc;
+		temp.dataWords = 3u * vertices;
+		h.pendingFrees.push_back({ frame, temp });
 	}
 
 	// ---------------------------------------------------------------------------------------------------------------------
@@ -1110,6 +1425,12 @@ namespace {
 		else c.spec.armed = false;
 	}
 
+	// UNOFFICIAL 2026-11-10 --wait cpu ([Main.Main.RayTracing] HelperWait 1; as NvrDlssHelper's since 2026-10-30): the helper waits on the CPU
+	// until the game's "inputs ready" reaches the frame, then submits with no semaphore wait in the submission. Measured on an L4: the game's
+	// GPU sat 4.6-7.9 ms a frame in the round trip beyond the helper's own work (builds + passes), in every mode, with the wait on the GPU.
+	// UNOFFICIAL 2026-11-10: --gpu-priority high (as NvrDlssHelper's): the queue at global priority HIGH where the driver allows it and the process's
+	// WDDM GPU scheduling class HIGH. --measure (with --wait cpu): per frame, when the helper saw the game's inputs, when it had submitted, when
+	// its GPU work began and ended (VK calibrated timestamps -> the QPC clock) and when it saw its own "output ready": a log line every 300 frames.
 	bool WaitSlot(Helper& h, Slot& s, HANDLE parent) {
 		if (!s.frame) return true;
 		VkSemaphoreWaitInfo wait = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
@@ -1130,6 +1451,29 @@ namespace {
 				const uint64_t mask = h.vk.timestampBits >= 64 ? ~0ull : ((1ull << h.vk.timestampBits) - 1);
 				auto us = [&](uint32_t a, uint32_t b) { return (uint64_t)((double)((stamps[b] - stamps[a]) & mask) * h.vk.properties.limits.timestampPeriod / 1000.0); };
 				const uint64_t total = us(0, 3);
+				if (g_measure && g_calibratedExt && !h.getCalibrated)
+					h.getCalibrated = (VkResult (VKAPI_PTR*)(VkDevice, uint32_t, const VkCalibratedTimestampInfoEXT*, uint64_t*, uint64_t*))vkGetDeviceProcAddr(h.vk.device, "vkGetCalibratedTimestampsEXT");
+				if (g_measure && h.getCalibrated && s.tWake && s.tSubmit && s.tOutSeen) {	// (--measure) this slot's frame on the QPC clock
+					VkCalibratedTimestampInfoEXT info[2] = { { VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, nullptr, VK_TIME_DOMAIN_DEVICE_EXT },
+						{ VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, nullptr, VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT } };
+					uint64_t now[2] = {}, deviation = 0;
+					LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+					if (h.getCalibrated(h.vk.device, 2, info, now, &deviation) == VK_SUCCESS) {
+						const double nsPerTick = h.vk.properties.limits.timestampPeriod, qpcMs = 1000.0 / (double)f.QuadPart;
+						auto agoMs = [&](uint32_t k) { return (double)((now[0] - stamps[k]) & mask) * nsPerTick / 1e6; };	// how long before 'now' stamp k was
+						const double nowMs = (double)(int64_t)now[1] * qpcMs;
+						const double startMs = nowMs - agoMs(0), endMs = nowMs - agoMs(3);
+						const double a = (double)(s.tSubmit - s.tWake) * qpcMs, b = startMs - (double)s.tSubmit * qpcMs, c = endMs - startMs, d = (double)s.tOutSeen * qpcMs - endMs;
+						h.mWakeToSubmit += a; h.mSubmitToStart += b; h.mWork += c; h.mEndToSeen += d; h.mCount++;
+						if (s.tFenceSeen) { const double e = (double)s.tFenceSeen * qpcMs - endMs; h.mEndToFence += e; h.mEndToFenceMax = std::max(h.mEndToFenceMax, e); }
+						h.mSubmitToStartMax = std::max(h.mSubmitToStartMax, b); h.mEndToSeenMax = std::max(h.mEndToSeenMax, d);
+						if (h.mCount >= 300) {
+							Log("measure (300 frames, ms): %s -> submitted %.3f | submitted -> GPU work began %.3f (max %.3f) | GPU work %.3f | GPU work ended -> own output seen %.3f (max %.3f), -> its fence seen %.3f (max %.3f); wait %s; signal %s; calibration deviation %llu ns",
+								g_cpuWait ? "inputs seen" : "frame taken up (inputs not seen: the wait is on the GPU, inside 'submitted -> GPU work began')", h.mWakeToSubmit / h.mCount, h.mSubmitToStart / h.mCount, h.mSubmitToStartMax, h.mWork / h.mCount, h.mEndToSeen / h.mCount, h.mEndToSeenMax, h.mEndToFence / h.mCount, h.mEndToFenceMax, g_cpuWait ? "cpu" : "gpu", g_cpuSignal ? "cpu (after the fence)" : "gpu", (unsigned long long)deviation);
+							h.mWakeToSubmit = h.mSubmitToStart = h.mWork = h.mEndToSeen = h.mSubmitToStartMax = h.mEndToSeenMax = h.mEndToFence = h.mEndToFenceMax = 0; h.mCount = 0;
+						}
+					}
+				}
 				h.gpuUs[h.gpuCount++ % 64] = total;
 				g_shared->gpuTimeUsLast = (uint32_t)total;
 				g_shared->gpuTimeUsAvg = Average(h.gpuUs, h.gpuCount);
@@ -1198,6 +1542,10 @@ namespace {
 		return true;
 	}
 
+#include "NvrRtShadowDenoise.inl"	// UNOFFICIAL 2026-11-07 the RT shadow denoiser module (docs/next/RT-DENOISER.md)
+#include "NvrRtDisplace.inl"	// UNOFFICIAL 2026-11-07 (protocol 8, rtgap-tessblas) displaced copies of the land / parallax objects
+#include "NvrRtOmm.inl"	// UNOFFICIAL 2026-11-07 (ptaaa-omm, protocol 9) opacity micromaps for alpha-tested geometry
+
 	// Records this frame's work into s.cmd (open). False: something could not be recorded (logged); the caller still submits.
 	bool RecordFrame(Helper& h, Slot& s, uint64_t frameNumber) {
 		const NvrRtFrame& f = h.frame;
@@ -1206,6 +1554,7 @@ namespace {
 		s.measured[0] = s.measured[1] = s.measured[2] = false;
 		s.passesStamped = 0;
 		FullBarrier(cmd);	// the previous frame's builds / passes and the game's writes (the semaphore makes them visible)
+		RealTex::Record(h, slot, cmd, frameNumber);	// (2026-11-07, protocol 7) new textures copied in, the slot table for this frame
 
 		// 0. compaction (NVR_RT_OP_FLAG_COMPACT): the structures whose compacted size came back are copied into one of that size; the
 		//    old one is freed once this frame is done (its data words stay with the geometry). Rebuilt or released since: skipped.
@@ -1252,10 +1601,11 @@ namespace {
 		std::vector<uint32_t> builtIds;
 		const SharedImage& arena = h.images[NVR_RT_ARENA_IMAGE];
 		uint32_t builds = 0;
-		for (uint32_t i = 0; i < f.opCount; i++) if (f.ops[i].op == NVR_RT_OP_BUILD) builds++;
+		uint32_t dataOps = 0;	// (2026-11-07, protocol 8) DATA ops read the arena too
+		for (uint32_t i = 0; i < f.opCount; i++) { if (f.ops[i].op == NVR_RT_OP_BUILD) builds++; else if (f.ops[i].op == NVR_RT_OP_DATA) dataOps++; }
 		const bool sequence = (f.arenaTexels & NVR_RT_ARENA_SEQUENCE) != 0;
 		const uint32_t arenaTexels = f.arenaTexels & ~NVR_RT_ARENA_SEQUENCE;
-		if (builds && arenaTexels) {
+		if ((builds || dataOps) && arenaTexels) {
 			const uint64_t capacity = (uint64_t)arena.width * arena.height;
 			const uint32_t rows = (uint32_t)std::min<uint64_t>((arenaTexels + (sequence ? 1u : 0u) + arena.width - 1) / arena.width, arena.height);
 			VkBufferImageCopy copy = {};
@@ -1293,9 +1643,19 @@ namespace {
 			std::vector<VkDeviceSize> scratchOffsets;
 			std::vector<VkBufferCopy> dataCopies;
 			const VkDeviceSize align = h.vk.asProperties.minAccelerationStructureScratchOffsetAlignment;
+			// (2026-11-06, the NVIDIA device-lost crashes) one build per geometry id a frame: the game can send the same id twice in a
+			// frame (an actor partition met twice), and both then went into the one vkCmdBuildAccelerationStructuresKHR call with the same
+			// destination (a full build and a refit of it, or two refits): VUID-...-dstAccelerationStructure-03698, found by the Khronos
+			// validation layer (NvrRtHelper.validate). AMD's builder survived it; NVIDIA's lost the device. Only the LAST op for an id is
+			// built (the newest pose / data); the earlier ones are skipped (counted in h.duplicateBuilds, logged every 600 frames).
+			std::unordered_map<uint32_t, uint32_t> lastBuildOf;
+			std::vector<uint32_t> normalsNow;	// (2026-11-07 perf-reflfix) geometries whose smooth normals are made this frame (RtNormals.comp)
+			for (uint32_t i = 0; i < f.opCount; i++)
+				if (f.ops[i].op == NVR_RT_OP_BUILD && f.ops[i].id) lastBuildOf[f.ops[i].id] = i;
 			for (uint32_t i = 0; i < f.opCount; i++) {
 				const NvrRtGeometryOp& op = f.ops[i];
 				if (op.op != NVR_RT_OP_BUILD) continue;
+				if (op.id) { auto last = lastBuildOf.find(op.id); if (last != lastBuildOf.end() && last->second != i) { h.duplicateBuilds++; continue; } }
 				const bool uv = (op.flags & NVR_RT_OP_FLAG_TEXCOORDS) != 0;
 				const uint64_t texels = 3ull * ((uint64_t)op.vertexCount + op.triangleCount) + (uv ? 2ull * op.vertexCount : 0ull);
 				if (!op.id || !op.vertexCount || !op.triangleCount || (uint64_t)op.arenaTexel + texels > std::min<uint64_t>(capacity, arenaTexels) ||
@@ -1342,6 +1702,8 @@ namespace {
 					b.dstAccelerationStructure = old.as;
 					if (old.vertexOffset != NVR_RT_NO_DATA)	// the posed positions for the shaders too (the triangle list is the same)
 						dataCopies.push_back({ (VkDeviceSize)op.arenaTexel * 4, (VkDeviceSize)old.vertexOffset * 4, (VkDeviceSize)op.vertexCount * 12 });
+					if (old.normalWords) normalsNow.push_back(op.id);	// (2026-11-07 perf-reflfix) its normals from the new pose
+
 					geoms.push_back(g);
 					infos.push_back(b);
 					ranges.push_back({ op.triangleCount, 0, 0, 0 });
@@ -1372,8 +1734,15 @@ namespace {
 				addressInfo.accelerationStructure = geo.as;
 				geo.address = h.vk.asAddress(h.vk.device, &addressInfo);
 				// its positions and triangle list kept for the shaders (binding 11), when there is room
+				// (2026-11-07 perf-reflfix) with a word a vertex before them for its smooth normals (RtNormals.comp; without room for those:
+				// the data alone, flat normals as before)
 				geo.dataWords = (uint32_t)texels;
-				geo.vertexOffset = h.dataWords.Allocate(geo.dataWords);
+				geo.normalWords = h.normalsPipeline ? op.vertexCount : 0u;
+				uint32_t base = h.dataWords.Allocate(geo.dataWords + geo.normalWords);
+				if (base == NVR_RT_NO_DATA && geo.normalWords) { geo.normalWords = 0; base = h.dataWords.Allocate(geo.dataWords); }
+				geo.vertexOffset = base == NVR_RT_NO_DATA ? NVR_RT_NO_DATA : base + geo.normalWords;
+				if (geo.vertexOffset == NVR_RT_NO_DATA) geo.normalWords = 0;
+				if (geo.normalWords) normalsNow.push_back(op.id);
 				if (geo.vertexOffset != NVR_RT_NO_DATA) {
 					geo.indexOffset = geo.vertexOffset + 3u * op.vertexCount;
 					if (uv) geo.uvOffset = geo.indexOffset + 3u * op.triangleCount;
@@ -1425,9 +1794,26 @@ namespace {
 				}
 				s.measured[0] = true;
 			}
+			// (2026-11-07 perf-reflfix) the smooth vertex normals of the geometry built / posed this frame (and of those still waiting)
+			MakeNormals(h, cmd, normalsNow, frameNumber);
+			// (2026-11-07, protocol 8) DATA ops: vertex attributes kept for the displacement (NvrRtDisplace.inl), no structure
+			if (dataOps) {
+				std::vector<VkBufferCopy> dataOnly;
+				for (uint32_t i = 0; i < f.opCount; i++)
+					if (f.ops[i].op == NVR_RT_OP_DATA) Displace::StageData(h, f.ops[i], capacity, arenaTexels, dataOnly);
+				if (!dataOnly.empty()) {
+					vkCmdCopyBuffer(cmd, h.staging.buffer, h.geometryData.buffer, (uint32_t)dataOnly.size(), dataOnly.data());
+					FullBarrier(cmd);
+					s.measured[0] = true;
+				}
+			}
 		}
 		for (uint32_t i = 0; i < f.opCount; i++)
-			if (f.ops[i].op == NVR_RT_OP_RELEASE) ReleaseGeometry(h, f.ops[i].id, frameNumber);
+			if (f.ops[i].op == NVR_RT_OP_RELEASE) { ReleaseGeometry(h, f.ops[i].id, frameNumber); Displace::Release(h, f.ops[i].id, frameNumber); }
+		// (2026-11-07, protocol 8) the displaced copies: new ones built, stale ones redone and refit (before the scene, which uses them)
+		Displace::Run(h, slot, cmd, frameNumber);
+		// (2026-11-07 ptaaa-omm, protocol 9) opacity micromaps: earlier checks collected, new ones built and checked (before the scene)
+		Omm::Run(h, slot, cmd, frameNumber);
 		if (h.queries) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, h.queries, slot * kQueriesPerSlot + 1);
 
 		// 2. the scene from this frame's instances
@@ -1438,18 +1824,26 @@ namespace {
 			const NvrRtInstance& in = f.instances[i];
 			auto it = h.geometries.find(in.geometryId);
 			if (it == h.geometries.end()) continue;
+			// (2026-11-07, protocol 8) a displaced instance is traced through its copy (positions, triangles, texcoords and structure)
+			const Geometry* displaced = Displace::CopyFor(in);
+			const Geometry& geo = displaced ? *displaced : it->second;
+			// (2026-11-07 ptaaa-omm) an alpha-tested instance whose micromap structure is ready and checked is traced through it: the same
+			// triangles (its record keeps the geometry's words), the known-solid micro-triangles resolved by the hardware
+			const Geometry* omm = displaced ? nullptr : Omm::VariantFor(h, in, f.records[i]);
 			NvrRtInstanceRecord& r = records[count];
 			r = f.records[i];
 			r.geometryId = in.geometryId;
-			r.vertexOffset = it->second.vertexOffset;
-			r.indexOffset = it->second.indexOffset;
+			r.vertexOffset = geo.vertexOffset;
+			r.indexOffset = geo.indexOffset;
+			// (2026-11-07 perf-reflfix) its smooth vertex normals are ready (just before its positions: RtHit.glsl rtHitSmoothNormal)
+			if (geo.normalWords && geo.normalsReady && geo.vertexOffset != NVR_RT_NO_DATA) r.geometryId |= NVR_RT_RECORD_GEO_NORMALS;
 			if (r.flags & NVR_RT_RECORD_ALPHA_TESTED) {
-				if (it->second.uvOffset == NVR_RT_NO_DATA) continue;	// no texcoords (no room in the data): it would block as a solid quad
-				memcpy(&r.albedo[3], &it->second.uvOffset, 4);
+				if (geo.uvOffset == NVR_RT_NO_DATA) continue;	// no texcoords (no room in the data): it would block as a solid quad
+				memcpy(&r.albedo[3], &geo.uvOffset, 4);
 			}
 			else if (r.flags & NVR_RT_RECORD_TEXTURED) {	// hit textures: the texcoords' offset, or no texture when there was no room
-				if (it->second.uvOffset == NVR_RT_NO_DATA) r.flags &= ~NVR_RT_RECORD_TEXTURED;
-				else memcpy(&r.albedo[3], &it->second.uvOffset, 4);
+				if (geo.uvOffset == NVR_RT_NO_DATA) r.flags &= ~NVR_RT_RECORD_TEXTURED;
+				else memcpy(&r.albedo[3], &geo.uvOffset, 4);
 			}
 			VkAccelerationStructureInstanceKHR& o = out[count++];
 			memcpy(&o.transform, in.transform, sizeof(o.transform));
@@ -1457,9 +1851,10 @@ namespace {
 			o.mask = in.mask & 0xFF;
 			o.instanceShaderBindingTableRecordOffset = 0;
 			o.flags = in.flags & 0xFF;
-			o.accelerationStructureReference = it->second.address;
+			o.accelerationStructureReference = omm ? omm->address : geo.address;
 		}
 		g_shared->lastInstances = count;
+		g_shared->ommInstances = Omm::g_omm.instances;
 		if (h.probeSlot == (int)slot)
 			for (uint32_t k = 0; k < h.probeCount; k++)
 				for (uint32_t i = 0; i < std::min<uint32_t>(f.instanceCount, NVR_RT_MAX_INSTANCES); i++)
@@ -1472,7 +1867,7 @@ namespace {
 			g.geometry.instances.data.deviceAddress = s.instances.address;
 			VkAccelerationStructureBuildGeometryInfoKHR b = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
 			b.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
-			b.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+			b.flags = TlasBuildFlags();
 			b.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
 			b.dstAccelerationStructure = h.tlas;
 			b.geometryCount = 1;
@@ -1488,8 +1883,23 @@ namespace {
 		if (h.queries) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, h.queries, slot * kQueriesPerSlot + 2);
 
 		// 3. the passes
+		if (!h.scratchCleared && h.scratchStore.buffer && f.passCount) {	// (2026-11-07) the scratch store starts at zero (the passes' "empty")
+			vkCmdFillBuffer(cmd, h.scratchStore.buffer, 0, VK_WHOLE_SIZE, 0u);
+			FullBarrier(cmd);
+			h.scratchCleared = true;
+		}
 		for (uint32_t p = 0; p < std::min<uint32_t>(f.passCount, NVR_RT_MAX_PASSES); p++) {
 			const NvrRtPass& pass = f.passes[p];
+			// UNOFFICIAL 2026-11-07 the RT shadow denoiser (NvrRtShadowDenoise.inl): a pass of RtShadowDenoise.spv runs the module
+			if (ShadowDenoise::IsModulePass(h, pass.shader)) {
+				if (!ShadowDenoise::Run(h, slot, cmd, p, pass)) continue;
+				s.measured[2] = true;
+				if (h.queries && s.passesStamped < NVR_RT_MAX_PASSES) {
+					vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, h.queries, slot * kQueriesPerSlot + 4 + s.passesStamped);
+					s.passShaders[s.passesStamped++] = pass.shader;
+				}
+				continue;
+			}
 			VkPipeline pipeline = Pipeline(h, pass.shader);
 			if (!pipeline || pass.imageCount > NVR_RT_PASS_IMAGES_MAX) continue;
 			bool imagesOk = true;
@@ -1502,9 +1912,10 @@ namespace {
 			asWrite.pAccelerationStructures = &h.tlas;
 			VkDescriptorBufferInfo ubo = { s.constants.buffer, (VkDeviceSize)p * NVR_RT_PASS_CONSTANTS, NVR_RT_PASS_CONSTANTS };
 			VkDescriptorImageInfo imageInfos[NVR_RT_PASS_IMAGES_MAX] = {};
-			VkWriteDescriptorSet writes[2 + NVR_RT_PASS_IMAGES_MAX + 2] = {};
+			VkWriteDescriptorSet writes[2 + NVR_RT_PASS_IMAGES_MAX + 3] = {};
 			VkDescriptorBufferInfo recordInfo = { s.records.buffer, 0, VK_WHOLE_SIZE };
 			VkDescriptorBufferInfo dataInfo = { h.geometryData.buffer, 0, VK_WHOLE_SIZE };
+			VkDescriptorBufferInfo scratchInfo = { h.scratchStore.buffer, 0, VK_WHOLE_SIZE };	// (protocol 6)
 			writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asWrite, s.sets[p], 0, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR };
 			writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.sets[p], 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &ubo };
 			for (uint32_t i = 0; i < pass.imageCount; i++) {
@@ -1513,9 +1924,11 @@ namespace {
 			}
 			writes[2 + pass.imageCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.sets[p], NVR_RT_BINDING_RECORDS, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &recordInfo };
 			writes[3 + pass.imageCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.sets[p], NVR_RT_BINDING_GEOMETRY, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &dataInfo };
-			vkUpdateDescriptorSets(h.vk.device, 4 + pass.imageCount, writes, 0, nullptr);
+			writes[4 + pass.imageCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.sets[p], NVR_RT_BINDING_SCRATCH, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &scratchInfo };
+			vkUpdateDescriptorSets(h.vk.device, 5 + pass.imageCount, writes, 0, nullptr);
 			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, h.pipelineLayout, 0, 1, &s.sets[p], 0, nullptr);
+			const VkDescriptorSet bound[2] = { s.sets[p], h.tex.sets[slot] };	// (protocol 7) set 1: real textures
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, h.pipelineLayout, 0, 2, bound, 0, nullptr);
 			vkCmdDispatch(cmd, std::max(1u, pass.groupsX), std::max(1u, pass.groupsY), std::max(1u, pass.groupsZ));
 			FullBarrier(cmd);	// the next pass may read this one's output; the game reads them after the signal
 			s.measured[2] = true;
@@ -1531,6 +1944,8 @@ namespace {
 	// One frame: GPU wait for inputsReady >= N, the work, signal outputReady = N. Always submits (even when the work could not be
 	// recorded) so the game's GPU wait for N is released.
 	bool ProcessFrame(Helper& h, uint64_t frameNumber, HANDLE parent) {
+		LARGE_INTEGER taken = {};	// (2026-11-11 --measure) when the helper took the frame up: the first stamp when the wait is on the GPU
+		if (g_measure) QueryPerformanceCounter(&taken);
 		const NvrRtFrame& ring = g_shared->frames[frameNumber % NVR_RT_FRAME_RING];
 		const bool intact = ring.frame == frameNumber;
 		if (intact) {
@@ -1543,9 +1958,12 @@ namespace {
 			memcpy(h.frame.instances, ring.instances, sizeof(NvrRtInstance) * h.frame.instanceCount);
 			memcpy(h.frame.records, ring.records, sizeof(NvrRtInstanceRecord) * h.frame.instanceCount);
 			memcpy(h.frame.passes, ring.passes, sizeof(NvrRtPass) * h.frame.passCount);
+			RealTex::CopyOut(h, frameNumber);	// (2026-11-07, protocol 7) the texture bytes too, before the region is free again
 		} else {
 			// NVR waits before reusing a slot, so this means NVR skipped the frame: nothing to do but release its wait
 			memset(&h.frame, 0, offsetof(NvrRtFrame, ops));
+			h.tex.bytes.clear();
+			h.tex.offsets.clear();
 		}
 		MemoryBarrier();
 		g_shared->consumedFrame = (int64_t)frameNumber;
@@ -1595,21 +2013,72 @@ namespace {
 		VK_CHECK(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 
 		const uint64_t waitValue = frameNumber, signalValue = frameNumber;
+		bool gpuWait = !g_cpuWait;
+		if (g_cpuWait) {	// (--wait cpu) the game's inputs first, on the CPU; a failure or the game going away: this frame waits on the GPU as before
+			VkSemaphoreWaitInfo wait = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+			wait.semaphoreCount = 1; wait.pSemaphores = &h.inputsReady; wait.pValues = &waitValue;
+			for (;;) {
+				const VkResult r = vkWaitSemaphores(h.vk.device, &wait, 250ull * 1000 * 1000);
+				if (r == VK_SUCCESS) { LARGE_INTEGER q; QueryPerformanceCounter(&q); s.tWake = q.QuadPart; break; }
+				if (r != VK_TIMEOUT) {
+					Log("--wait cpu: waiting for the game's inputs failed (%s); the helper's submissions wait on the GPU from now on", VkResultName(r));
+					g_cpuWait = false; gpuWait = true; break;
+				}
+				if ((g_parent && WaitForSingleObject(g_parent, 0) == WAIT_OBJECT_0) || g_shared->quit) { gpuWait = true; break; }
+			}
+		}
+		// (2026-11-11 --measure) with the wait on the GPU the helper never sees the game's inputs: its first stamp is when it took the frame up.
+		// Before, every stamp stayed 0 in that mode (only --wait cpu set tWake, and the block below ran only without the GPU wait), so WaitSlot's
+		// test never passed and the "measure" line was never written.
+		if (g_measure && gpuWait) s.tWake = taken.QuadPart;
 		VkTimelineSemaphoreSubmitInfo timeline = { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
-		timeline.waitSemaphoreValueCount = 1;
-		timeline.pWaitSemaphoreValues = &waitValue;
-		timeline.signalSemaphoreValueCount = 1;
-		timeline.pSignalSemaphoreValues = &signalValue;
+		timeline.waitSemaphoreValueCount = gpuWait ? 1 : 0;
+		timeline.pWaitSemaphoreValues = gpuWait ? &waitValue : nullptr;
+		// UNOFFICIAL 2026-11-10 --signal cpu (measured on an L4: the helper's own timeline semaphore became visible 2.3-2.9 ms, at most 4 ms,
+		// after its GPU work had ended, with any timer resolution; a plain fence may be told sooner): the submission carries a FENCE and no
+		// semaphore signal; the helper waits for the fence on the CPU and then signals "output ready" itself (vkSignalSemaphore).
+		const bool wantFence = g_measure || (g_cpuSignal && !gpuWait);	// (2026-11-11: --measure in every wait mode; was (g_measure || g_cpuSignal) && !gpuWait)
+		if (wantFence && !s.fence) { VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO }; if (vkCreateFence(h.vk.device, &fi, nullptr, &s.fence) != VK_SUCCESS) s.fence = VK_NULL_HANDLE; }
+		const bool useFence = wantFence && s.fence;
+		if (useFence) vkResetFences(h.vk.device, 1, &s.fence);
+		const bool cpuSignal = g_cpuSignal && useFence && !gpuWait;	// (--signal cpu needs --wait cpu, as before)
+		timeline.signalSemaphoreValueCount = cpuSignal ? 0 : 1;
+		timeline.pSignalSemaphoreValues = cpuSignal ? nullptr : &signalValue;
 		const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 		VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO, &timeline };
-		submit.waitSemaphoreCount = 1;
-		submit.pWaitSemaphores = &h.inputsReady;
-		submit.pWaitDstStageMask = &waitStage;
+		submit.waitSemaphoreCount = gpuWait ? 1 : 0;
+		submit.pWaitSemaphores = gpuWait ? &h.inputsReady : nullptr;
+		submit.pWaitDstStageMask = gpuWait ? &waitStage : nullptr;
 		submit.commandBufferCount = 1;
 		submit.pCommandBuffers = &cmd;
-		submit.signalSemaphoreCount = 1;
-		submit.pSignalSemaphores = &h.outputReady;
-		VK_CHECK(vkQueueSubmit(h.vk.queue, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit");
+		submit.signalSemaphoreCount = cpuSignal ? 0 : 1;
+		submit.pSignalSemaphores = cpuSignal ? nullptr : &h.outputReady;
+		VK_CHECK(vkQueueSubmit(h.vk.queue, 1, &submit, useFence ? s.fence : VK_NULL_HANDLE), "vkQueueSubmit");
+		s.tFenceSeen = 0;
+		if (useFence) {
+			LARGE_INTEGER q0; QueryPerformanceCounter(&q0); s.tSubmit = q0.QuadPart;
+			VkResult fr = VK_TIMEOUT;
+			for (int tries = 0; tries < 40 && fr == VK_TIMEOUT; tries++) {	// 10 s at most, the game's death or a quit ends it
+				fr = vkWaitForFences(h.vk.device, 1, &s.fence, VK_TRUE, 250ull * 1000 * 1000);
+				if (fr == VK_TIMEOUT && ((g_parent && WaitForSingleObject(g_parent, 0) == WAIT_OBJECT_0) || g_shared->quit)) break;
+			}
+			if (fr == VK_SUCCESS) { LARGE_INTEGER q1; QueryPerformanceCounter(&q1); s.tFenceSeen = q1.QuadPart; }
+			if (cpuSignal) {
+				if (fr != VK_SUCCESS) vkQueueWaitIdle(h.vk.queue);	// (never signal before the work is done: the game reads the outputs next)
+				VkSemaphoreSignalInfo si = { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };
+				si.semaphore = h.outputReady; si.value = signalValue;
+				const VkResult sr = vkSignalSemaphore(h.vk.device, &si);
+				if (sr != VK_SUCCESS) { Log("--signal cpu: vkSignalSemaphore failed (%s) at frame %llu: the GPU signals again from now on", VkResultName(sr), (unsigned long long)frameNumber); g_cpuSignal = false; }
+			}
+		}
+		if (g_measure) {	// (--measure) when this frame's own "output ready" is seen from the CPU (a wake-up latency sample; 250 ms at most). (2026-11-11) in every wait mode: with the wait on the GPU this CPU wait (and the fence's) holds the helper's thread each frame: bench only
+			LARGE_INTEGER q; QueryPerformanceCounter(&q); if (!useFence) s.tSubmit = q.QuadPart;
+			VkSemaphoreWaitInfo own = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+			own.semaphoreCount = 1; own.pSemaphores = &h.outputReady; own.pValues = &signalValue;
+			if (vkWaitSemaphores(h.vk.device, &own, 250ull * 1000 * 1000) == VK_SUCCESS) { QueryPerformanceCounter(&q); s.tOutSeen = q.QuadPart; } else s.tOutSeen = 0;
+		}
+		else if (!useFence) s.tWake = s.tSubmit = s.tOutSeen = 0;
+		h.lastSubmitted = frameNumber;
 		s.frame = frameNumber;
 		if (h.capture.active) CaptureFinish(h, s, frameNumber);	// (2026-11-03) waits for this frame, writes the file on a thread
 
@@ -1659,11 +2128,136 @@ namespace {
 		if (frameNumber % 600 == 0 && (h.refits || h.fullBuilds))
 			Log("frame %llu: dynamic (actor) geometry: %llu refits in place, %llu full builds so far", (unsigned long long)frameNumber,
 				(unsigned long long)h.refits, (unsigned long long)h.fullBuilds);
+		if (frameNumber % 600 == 0 && (h.tex.uploaded || h.tex.refused))	// (2026-11-07, protocol 7)
+			Log("frame %llu: real textures: %llu alive (%llu MB), %llu uploaded, %llu refused so far", (unsigned long long)frameNumber,
+				(unsigned long long)h.tex.alive, (unsigned long long)(h.tex.aliveBytes >> 20), (unsigned long long)h.tex.uploaded, (unsigned long long)h.tex.refused);
+		if (frameNumber % 600 == 0 && h.duplicateBuilds)
+			Log("frame %llu: %llu duplicate builds skipped so far (the same geometry id twice in a frame: only the last is built)",
+				(unsigned long long)frameNumber, (unsigned long long)h.duplicateBuilds);
+		if (frameNumber % 600 == 0 && (h.normalsMade || h.normalsNoRoom))	// (2026-11-07 perf-reflfix)
+			Log("frame %llu: smooth normals made for %llu geometries (+ %llu refreshed after a pose), %llu vertices, %zu waiting, %llu frames without room",
+				(unsigned long long)frameNumber, (unsigned long long)h.normalsMade, (unsigned long long)h.normalsRefreshed,
+				(unsigned long long)h.normalsVertices, h.normalsWaiting.size(), (unsigned long long)h.normalsNoRoom);
 		return true;
 	}
 
-	int RunHelper(const wchar_t* base) {
-		OpenLog(L"NvrRtHelper.log");
+	// (2026-11-07 rt-shutdown) THE HELPER'S WAY OUT (quit, the game gone, a frame that failed). The game's GPU queue waits for
+	// "output ready" = N for every frame N it published; a value never signalled kept that queue waiting after a process left, and on
+	// the AMD iGPU the driver then reset the display (System event 4101). So, before the helper exits:
+	//   1. every published frame not run (next .. latestFrame) is released without work: with the game alive one batch a frame (wait for
+	//      the game's inputsReady = N, signal outputReady = N: the game's queue signals N + 1 only after its wait for N); with the game gone
+	//      one batch that waits for nothing (its signals may never reach the GPU) and signals outputReady = latestFrame;
+	//   2. a CPU wait (bounded) until outputReady reaches the last value queued. When it does not, a submission still waits for an
+	//      inputsReady the game never signalled (it died before its signal reached the GPU, or it hangs): inputsReady is signalled from
+	//      the CPU (logged as FORCED), then waited for again;
+	//   3. a release that could not be submitted (device lost): once the queue signals nothing more, outputReady = latestFrame from the CPU;
+	//   4. vkDeviceWaitIdle, bounded (a thread: a hung queue must not keep the process); the pool + semaphores destroyed when idle;
+	//   5. the final values in the log and the status line (the game logs it): "exit: ... clean" or "... FORCED".
+	struct IdleWait { VkDevice device; VkResult result; };
+	DWORD WINAPI IdleWaitMain(void* p) { IdleWait* w = (IdleWait*)p; w->result = vkDeviceWaitIdle(w->device); return 0; }
+
+	void ShutdownDrain(Helper& h, uint64_t next, bool parentGone, const char* why) {
+		VkDevice device = h.vk.device;
+		const int64_t published = InterlockedCompareExchange64((volatile LONG64*)&g_shared->latestFrame, 0, 0);
+		const uint64_t latest = published > 0 ? (uint64_t)published : 0;
+		auto value = [&](VkSemaphore s) { uint64_t v = 0; if (s) vkGetSemaphoreCounterValue(device, s, &v); return v; };
+		auto waitOutput = [&](uint64_t target, DWORD ms) {
+			if (!target) return true;
+			VkSemaphoreWaitInfo wait = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+			wait.semaphoreCount = 1;
+			wait.pSemaphores = &h.outputReady;
+			wait.pValues = &target;
+			return vkWaitSemaphores(device, &wait, (uint64_t)ms * 1000 * 1000) == VK_SUCCESS;
+		};
+		const ULONGLONG t0 = GetTickCount64();
+		Log("shutdown (%s): frames 1..%llu published, %llu submitted, %llu not run; inputs ready at %llu, output ready at %llu", why,
+			(unsigned long long)latest, (unsigned long long)h.lastSubmitted, (unsigned long long)(latest >= next ? latest - next + 1 : 0),
+			(unsigned long long)value(h.inputsReady), (unsigned long long)value(h.outputReady));
+		bool forced = false;
+		uint64_t queued = h.lastSubmitted;	// the highest outputReady value the queue will signal
+		bool releaseFailed = false;
+		// 1. the release: game alive, ONE BATCH A FRAME (wait inputsReady >= N, signal outputReady = N), all in one vkQueueSubmit. Not one
+		//    batch waiting for the last frame's inputs: the game's queue signals inputs ready N + 1 only after its own wait for output ready
+		//    N, so that single wait never ends (the RT host's shutdown scene deadlocked on it until the helper forced it, 2026-11-07).
+		//    Game gone: one batch, no wait, signal outputReady = latestFrame.
+		if (latest >= next && latest > h.lastSubmitted) {
+			const uint64_t first = parentGone ? latest : next;
+			const size_t count = (size_t)(latest - first + 1);
+			std::vector<uint64_t> values(count);
+			std::vector<VkTimelineSemaphoreSubmitInfo> timelines(count, { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO });
+			std::vector<VkSubmitInfo> batches(count, { VK_STRUCTURE_TYPE_SUBMIT_INFO });
+			const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+			for (size_t i = 0; i < count; i++) {
+				values[i] = first + i;
+				VkTimelineSemaphoreSubmitInfo& t = timelines[i];
+				t.waitSemaphoreValueCount = parentGone ? 0 : 1;
+				t.pWaitSemaphoreValues = parentGone ? nullptr : &values[i];
+				t.signalSemaphoreValueCount = 1;
+				t.pSignalSemaphoreValues = &values[i];
+				VkSubmitInfo& b = batches[i];
+				b.pNext = &t;
+				b.waitSemaphoreCount = parentGone ? 0 : 1;
+				b.pWaitSemaphores = parentGone ? nullptr : &h.inputsReady;
+				b.pWaitDstStageMask = parentGone ? nullptr : &waitStage;
+				b.signalSemaphoreCount = 1;
+				b.pSignalSemaphores = &h.outputReady;
+			}
+			const VkResult r = vkQueueSubmit(h.vk.queue, (uint32_t)count, batches.data(), VK_NULL_HANDLE);
+			if (r == VK_SUCCESS) {
+				queued = latest;
+				Log("shutdown: frames %llu..%llu released (%s)", (unsigned long long)next, (unsigned long long)latest,
+					parentGone ? "one batch, waits for nothing: the game is gone" : "a batch a frame, each after the game's inputs ready for it");
+			}
+			else { releaseFailed = true; Log("shutdown: the release submission failed: %s", VkResultName(r)); }
+		}
+		// 2. the queue signals everything queued
+		if (!waitOutput(queued, parentGone ? 1000 : 3000)) {
+			const uint64_t in = value(h.inputsReady);
+			if (in < queued) {
+				VkSemaphoreSignalInfo signal = { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };
+				signal.semaphore = h.inputsReady;
+				signal.value = queued;
+				const VkResult r = vkSignalSemaphore(device, &signal);
+				Log("shutdown: FORCED: output ready still at %llu of %llu, a submission waits for inputs ready %llu (at %llu, the game %s): signalled from the CPU (%s)",
+					(unsigned long long)value(h.outputReady), (unsigned long long)queued, (unsigned long long)queued, (unsigned long long)in,
+					parentGone ? "is gone" : "did not signal it", VkResultName(r));
+			}
+			else Log("shutdown: FORCED: output ready still at %llu of %llu with inputs ready at %llu (the queue is slow or hung)",
+				(unsigned long long)value(h.outputReady), (unsigned long long)queued, (unsigned long long)in);
+			forced = true;
+			if (!waitOutput(queued, 2000)) Log("shutdown: output ready still at %llu of %llu after the release", (unsigned long long)value(h.outputReady), (unsigned long long)queued);
+		}
+		// 3. a release that never went out: from the CPU, once the queue signals nothing more
+		if (releaseFailed) {
+			const uint64_t out = value(h.outputReady);
+			if (out >= queued && out < latest) {
+				VkSemaphoreSignalInfo signal = { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };
+				signal.semaphore = h.outputReady;
+				signal.value = latest;
+				Log("shutdown: FORCED: output ready %llu -> %llu from the CPU (%s)", (unsigned long long)out, (unsigned long long)latest, VkResultName(vkSignalSemaphore(device, &signal)));
+			}
+			forced = true;
+		}
+		// 4. the GPU idle, bounded
+		IdleWait* idle = new IdleWait{ device, VK_TIMEOUT };	// (leaked when the wait times out: the thread may still use it)
+		HANDLE thread = CreateThread(nullptr, 64 * 1024, IdleWaitMain, idle, 0, nullptr);
+		const bool idleOk = thread && WaitForSingleObject(thread, 3000) == WAIT_OBJECT_0 && idle->result == VK_SUCCESS;
+		if (!idleOk) { Log("shutdown: vkDeviceWaitIdle %s: exiting anyway", thread && WaitForSingleObject(thread, 0) == WAIT_OBJECT_0 ? VkResultName(idle->result) : "did not return in 3 s"); forced = true; }
+		const uint64_t in = value(h.inputsReady), out = value(h.outputReady);
+		if (thread && WaitForSingleObject(thread, 0) == WAIT_OBJECT_0) { CloseHandle(thread); delete idle; }
+		if (out < latest) forced = true;
+		if (idleOk) {
+			if (h.pool) { vkDestroyCommandPool(device, h.pool, nullptr); h.pool = VK_NULL_HANDLE; }
+			if (h.inputsReady) { vkDestroySemaphore(device, h.inputsReady, nullptr); h.inputsReady = VK_NULL_HANDLE; }
+			if (h.outputReady) { vkDestroySemaphore(device, h.outputReady, nullptr); h.outputReady = VK_NULL_HANDLE; }
+		}
+		// 5. (the status line: NVR logs it; the RT test host reads it)
+		Status("exit: output ready %llu of %llu published frames, inputs ready %llu, GPU %s, %llu ms: %s", (unsigned long long)out, (unsigned long long)latest,
+			(unsigned long long)in, idleOk ? "idle" : "NOT idle", (unsigned long long)(GetTickCount64() - t0), forced ? "FORCED (see NvrRtHelper.log)" : "clean");
+	}
+
+	int RunHelper(const wchar_t* base, const wchar_t* logName) {
+		OpenLog(logName && *logName ? logName : L"NvrRtHelper.log");
 		Log("NvrRtHelper (protocol %u) for New Vegas Reloaded, shared block %ls", NVR_RT_PROTOCOL_VERSION, base);
 		HANDLE mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, base);
 		if (!mapping) { Log("the shared block %ls does not exist (error %lu)", base, GetLastError()); return 2; }
@@ -1681,6 +2275,17 @@ namespace {
 		if (!frameEvent || !g_statusEvent) { Status("the helper's events do not exist"); SetState(NVR_RT_STATE_FAILED); return 2; }
 		HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, shared->parentPid);
 		if (!parent) { Status("the game's process %u cannot be opened", shared->parentPid); SetState(NVR_RT_STATE_FAILED); return 2; }
+		g_parent = parent;
+		if (g_highPriority) {	// (as NvrDlssHelper) the process's WDDM GPU scheduling priority class HIGH (4); the CPU class does not reach the GPU
+			typedef LONG(APIENTRY* SetGpuPriorityClass)(HANDLE, int);
+			const SetGpuPriorityClass setClass = (SetGpuPriorityClass)GetProcAddress(GetModuleHandleW(L"gdi32.dll") ? GetModuleHandleW(L"gdi32.dll") : LoadLibraryW(L"gdi32.dll"), "D3DKMTSetProcessSchedulingPriorityClass");
+			const LONG status = setClass ? setClass(GetCurrentProcess(), 4) : -1;
+			Log("GPU priority: the process's GPU scheduling priority class HIGH: %s (NTSTATUS 0x%08lX)", status == 0 ? "set" : "not set", (unsigned long)status);
+		}
+		Log("start options: signal %s, GPU priority %s, measure %s, timer %s", g_cpuSignal ? "cpu (a fence, then vkSignalSemaphore)" : "gpu", g_highPriority ? "high" : "normal", g_measure ? "on" : "off",
+			g_timerResult == -2 ? "as the system gives it" : g_timerResult == 0 ? "1 ms (timeBeginPeriod)" : "1 ms asked, refused");
+		Log("start option: %s", g_cpuWait ? "--wait cpu (the helper waits for the game's inputs on the CPU, then submits)" : "--wait gpu (the submission waits on the GPU)");
+		if (g_measure && !g_cpuWait) Log("start option: --measure with the wait on the GPU: the helper's thread waits each frame for its own fence and output on the CPU (bench only: it cannot record the next frame meanwhile)");
 
 		for (int i = 0; i < 100 && !shared->setupDone; i++) {
 			HANDLE waits[2] = { frameEvent, parent };
@@ -1693,6 +2298,7 @@ namespace {
 		Helper& h = *hp;
 		auto fail = [&](const char* why) { if (why) Status("%s", why); SetState(NVR_RT_STATE_FAILED); return 3; };
 		if (!CreateVulkanDevice(h.vk, shared->deviceLuid, shared->deviceLuidValid != 0, shared->deviceUuid)) return fail(nullptr);
+		PipelineCacheOpen(h.vk);	// (2026-11-09) before any pipeline is made
 		if (memcmp(h.vk.ids.driverUUID, shared->driverUuid, VK_UUID_SIZE))
 			return fail("the helper's Vulkan driver is not the game's (driver UUIDs differ): images cannot be shared");
 		h.imageCount = std::min<uint32_t>(shared->imageCount, NVR_RT_MAX_IMAGES);
@@ -1741,13 +2347,30 @@ namespace {
 					info.stage.module = module;
 					info.stage.pName = "main";
 					info.layout = h.guardLayout;
-					if (vkCreateComputePipelines(h.vk.device, VK_NULL_HANDLE, 1, &info, nullptr, &h.guardPipeline) != VK_SUCCESS) h.guardPipeline = VK_NULL_HANDLE;
+					if (vkCreateComputePipelines(h.vk.device, g_pipelineCache, 1, &info, nullptr, &h.guardPipeline) != VK_SUCCESS) h.guardPipeline = VK_NULL_HANDLE;
 					vkDestroyShaderModule(h.vk.device, module, nullptr);
 				}
 				if (!CreateBuffer(h.vk, kCmdRing * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, h.guardResult))
 					h.guardResult = Buffer();
 				else memset(h.guardResult.mapped, 0, kCmdRing * 8);
 				Log("arena guard: %s", h.guardPipeline && h.guardResult.buffer ? "on (indices clamped before every build, sequence texel checked)" : "OFF (pipeline or buffer failed)");
+				// (2026-11-07 perf-reflfix) the smooth vertex normals (RtNormals.comp): 40 bytes of push constants, no descriptors
+				VkShaderModuleCreateInfo normalsInfo = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+				normalsInfo.codeSize = sizeof(kRtNormalsSpv);
+				normalsInfo.pCode = kRtNormalsSpv;
+				VkShaderModule normalsModule = VK_NULL_HANDLE;
+				if (vkCreatePipelineLayout(h.vk.device, &layoutInfo, nullptr, &h.normalsLayout) == VK_SUCCESS &&
+					vkCreateShaderModule(h.vk.device, &normalsInfo, nullptr, &normalsModule) == VK_SUCCESS) {
+					VkComputePipelineCreateInfo info = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+					info.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+					info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+					info.stage.module = normalsModule;
+					info.stage.pName = "main";
+					info.layout = h.normalsLayout;
+					if (vkCreateComputePipelines(h.vk.device, g_pipelineCache, 1, &info, nullptr, &h.normalsPipeline) != VK_SUCCESS) h.normalsPipeline = VK_NULL_HANDLE;
+					vkDestroyShaderModule(h.vk.device, normalsModule, nullptr);
+				}
+				Log("smooth normals: %s", h.normalsPipeline ? "on (a packed normal a vertex before its positions, RtNormals.comp)" : "OFF (pipeline failed: flat triangle normals)");
 			}
 			if (h.vk.cmdWriteAsProperties && h.vk.cmdCopyAs) {
 				VkQueryPoolCreateInfo compactInfo = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
@@ -1760,13 +2383,126 @@ namespace {
 		if (!CreateBuffer(h.vk, (VkDeviceSize)arena.width * arena.height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT |
 				VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, false, h.staging) ||
 			!CreateBuffer(h.vk, (VkDeviceSize)kDataWords * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-				VK_BUFFER_USAGE_TRANSFER_SRC_BIT, false, h.geometryData) ||	// (TRANSFER_SRC: the capture copies it out, 2026-11-03)
+				VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, false, h.geometryData) ||	// (build input: the displaced copies, 2026-11-07)	// (TRANSFER_SRC: the capture copies it out, 2026-11-03)
 			!CreateTlas(h) || !EnsureScratch(h, h.tlasScratch) || !CreatePipelineLayout(h))
 			return fail(nullptr);
+		{	// (2026-11-07, protocol 6) the scratch store (binding 20): as big as NVR asked, at least 1 MB, cleared before the first pass
+			const uint32_t mb = std::min<uint32_t>(std::max<uint32_t>(shared->scratchMB, 1u), 1024u);
+			if (!CreateBuffer(h.vk, (VkDeviceSize)mb << 20, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false, h.scratchStore))
+				return fail("Vulkan: the scratch store could not be made");
+			Log("scratch store: %u MB (binding %u)", mb, NVR_RT_BINDING_SCRATCH);
+		}
+		RealTex::Open(h, base, shared->textureStagingMB);	// (2026-11-07, protocol 7) the "-tex" block, when NVR made one
 		if (!CreateBuffer(h.vk, 3 * 4096, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, h.probe)) h.probe = Buffer();	// the probe is optional
 
 		// The shaders NVR registered at setup are compiled now (a first use mid-game would hold the game's GPU ~2 s on the iGPU)
-		for (uint32_t i = 0; i < std::min<uint32_t>((uint32_t)shared->shaderCount, NVR_RT_MAX_SHADERS); i++) Pipeline(h, i);
+		// UNOFFICIAL 2026-11-11 (docs/next/RT-HELPER-STARTUP-2026-11-11.md, change A) built on a few worker threads at once: the start takes
+		// about as long as its slowest pipeline instead of the sum (cloud L4 after a path-tracing shader changed: 55-58 s serial, RtPathTrace
+		// alone 27-29 s). All are joined before anything below, so "ready" and everything after it are as before. The way back:
+		// NVR_RT_HELPER_SERIAL in the environment (any value; the helper inherits the game's environment) or --serial-pipelines = the old
+		// serial loop on this thread. Thread safety: BuildPipeline (above) writes nothing shared; each worker writes only its own `built[i]`
+		// and `ms[i]` (pre-sized); h.pipelines / h.pipelineTried (a bit-packed vector<bool>: neighbouring bits share a word, so never written
+		// from two threads) are sized before the workers start and filled here after the join; a failure's Status() line and its
+		// shaderFailures bit are written here after the join, in index order, as Pipeline() writes them; the cache is saved only once, after
+		// "ready" (PipelineCacheSave below; g_pipelineCacheLive is still false here, so nothing saves before).
+		{	// (the summary line: docs/next/SHADER-COMPILE-TIMES-2026-11-11.md, extended for the threads)
+			LARGE_INTEGER freq, wallStart; QueryPerformanceFrequency(&freq);
+			auto msSince = [&freq](const LARGE_INTEGER& from) { LARGE_INTEGER now; QueryPerformanceCounter(&now); return (double)(now.QuadPart - from.QuadPart) * 1000.0 / (double)freq.QuadPart; };
+			const uint32_t count = std::min<uint32_t>((uint32_t)shared->shaderCount, NVR_RT_MAX_SHADERS);
+			std::vector<double> ms(count, 0.0);	// each pipeline's own time (in its worker)
+			const bool serialEnv = getenv("NVR_RT_HELPER_SERIAL") != nullptr;
+			const unsigned cores = std::thread::hardware_concurrency();	// (0: unknown -> 1 worker)
+			const uint32_t want = std::min<uint32_t>(std::min<uint32_t>(count, (uint32_t)std::max<int>(1, (int)cores - 1)), 8u);
+			uint32_t workers = 0;
+			char mode[160];
+			QueryPerformanceCounter(&wallStart);
+			if (serialEnv || g_serialPipelines || count <= 1) {
+				snprintf(mode, sizeof(mode), "serial (%s)", serialEnv ? "NVR_RT_HELPER_SERIAL is set" : g_serialPipelines ? "--serial-pipelines" : "one pipeline or none");
+				Log("start pipelines: building %u, %s", count, mode);
+				for (uint32_t i = 0; i < count; i++) { LARGE_INTEGER a; QueryPerformanceCounter(&a); Pipeline(h, i); ms[i] = msSince(a); }
+			} else {
+				struct Built { VkPipeline pipeline = VK_NULL_HANDLE; std::string failure; };
+				std::vector<Built> built(count);
+				// the biggest .spv first: the path tracer's pipelines start at once, the small ones fill the other workers
+				std::vector<uint32_t> order(count);
+				std::vector<uint64_t> bytes(count, 0);
+				for (uint32_t i = 0; i < count; i++) {
+					order[i] = i;
+					char path[261] = {};
+					memcpy(path, shared->shaderPaths[i], 260);
+					WIN32_FILE_ATTRIBUTE_DATA fa;
+					if (GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) bytes[i] = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+				}
+				std::stable_sort(order.begin(), order.end(), [&bytes](uint32_t x, uint32_t y) { return bytes[x] > bytes[y]; });
+				if (h.pipelines.size() < NVR_RT_MAX_SHADERS) { h.pipelines.resize(NVR_RT_MAX_SHADERS, VK_NULL_HANDLE); h.pipelineTried.resize(NVR_RT_MAX_SHADERS, false); }
+				std::atomic<uint32_t> nextJob(0);
+				auto work = [&](bool ownThread) {
+					// (the helper runs at ABOVE_NORMAL priority class: below-normal threads there still sit above the game's normal ones)
+					if (ownThread) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+					for (uint32_t job = nextJob.fetch_add(1); job < count; job = nextJob.fetch_add(1)) {
+						const uint32_t i = order[job];
+						LARGE_INTEGER a; QueryPerformanceCounter(&a);
+						built[i].pipeline = BuildPipeline(h, i, built[i].failure);
+						ms[i] = msSince(a);
+					}
+				};
+				Log("start pipelines: building %u on up to %u worker threads (%u hardware threads)", count, want, cores);
+				std::vector<std::thread> pool;
+				for (uint32_t t = 0; t < want; t++) {
+					try { pool.emplace_back(work, true); }
+					catch (...) { Log("start pipelines: worker thread %u could not be started", t); break; }
+				}
+				workers = (uint32_t)pool.size();
+				if (!workers) work(false);	// no thread at all: this thread builds them, one after another
+				for (std::thread& t : pool) t.join();
+				if (workers) snprintf(mode, sizeof(mode), "parallel, %u worker thread%s", workers, workers == 1 ? "" : "s");
+				else snprintf(mode, sizeof(mode), "serial (no worker thread could be started)");
+				// UNOFFICIAL 2026-11-11 (the no-game test on an integrated GPU: with 8 workers both path tracing pipelines failed with
+				// VK_ERROR_OUT_OF_HOST_MEMORY, and alone, one after another, both built in 16 s each): several big compiles at once can
+				// run a driver out of memory that has room for each alone. A pipeline that failed next to others is built once more
+				// here, by itself, before it counts as failed.
+				if (workers > 1) for (uint32_t i = 0; i < count; i++) {
+					if (built[i].failure.empty()) continue;
+					const std::string first = built[i].failure;
+					const auto retryStart = std::chrono::steady_clock::now();
+					built[i].failure.clear();
+					built[i].pipeline = BuildPipeline(h, i, built[i].failure);
+					const double retryMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - retryStart).count();
+					ms[i] += retryMs;
+					Log("start pipelines: trace shader %u failed next to the others (%s); built alone: %s after %.0f ms", i, first.c_str(),
+						built[i].failure.empty() ? "ok" : "failed again", retryMs);
+				}
+				for (uint32_t i = 0; i < count; i++) {	// as Pipeline() does, now on this thread
+					h.pipelineTried[i] = true;
+					if (!built[i].failure.empty()) {
+						Status("%s", built[i].failure.c_str());
+						InterlockedOr((volatile LONG*)&shared->shaderFailures, (LONG)(1u << i));
+					} else h.pipelines[i] = built[i].pipeline;
+				}
+			}
+			const double wallMs = msSince(wallStart);
+			double sumMs = 0.0;
+			uint32_t failed = 0, quick = 0;
+			std::vector<uint32_t> slow(count);
+			for (uint32_t i = 0; i < count; i++) {
+				slow[i] = i;
+				sumMs += ms[i];
+				if (i >= h.pipelines.size() || !h.pipelines[i]) failed++;
+				else if (ms[i] < 50.0) quick++;
+			}
+			std::stable_sort(slow.begin(), slow.end(), [&ms](uint32_t x, uint32_t y) { return ms[x] > ms[y]; });
+			std::string slowest;
+			for (uint32_t k = 0; k < count && k < 8; k++) {
+				char name[261] = {};
+				memcpy(name, shared->shaderPaths[slow[k]], 260);
+				const char* file = strrchr(name, '\\');
+				char one[96];
+				snprintf(one, sizeof(one), "%s%.48s %.0f", k ? ", " : "", file ? file + 1 : name, ms[slow[k]]);
+				slowest += one;
+			}
+			Log("start pipelines: %u in %.0f ms wall, %s (their own times add up to %.0f ms); %u failed; %u built in under 50 ms (likely from the pipeline cache: the driver is not asked which were); slowest (ms): %s",
+				count, wallMs, mode, sumMs, failed, quick, slowest.empty() ? "none" : slowest.c_str());
+		}
 
 		h.dataWords.Init(kDataWords);
 		ReadCaptureSpec(g_exeDir + L"\\NvrRtHelper.capture-at", h.capture.spec);	// UNOFFICIAL 2026-11-03: a capture at a given frame (CaptureSpec)
@@ -1778,37 +2514,74 @@ namespace {
 			if (h.structures.Allocate(h.vk, 256, block, offset)) h.structures.Free(h.vk, block, offset, 256);
 			if (!EnsureScratch(h, 16ull << 20)) return fail(nullptr);
 		}
-		Status("ready: ray tracing on %s, the game's GPU (found by %s; %u shared images, arena %ux%u)", h.vk.properties.deviceName, h.vk.matchedBy,
-			h.imageCount, arena.width, arena.height);
+		// (2026-11-06, validation: "expects ... VK_IMAGE_LAYOUT_GENERAL, instead current layout is VK_IMAGE_LAYOUT_UNDEFINED") the shared
+		// images are used in GENERAL from the first frame but were never put there: one transition, now, before the game writes anything
+		// (it waits for READY), so dropping the old (empty) contents is harmless. NVIDIA is the stricter driver about layouts.
+		{
+			std::vector<VkImageMemoryBarrier> to;
+			for (uint32_t i = 0; i < h.imageCount; i++) {
+				if (!h.images[i].image) continue;
+				VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+				b.srcAccessMask = 0;
+				b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+				b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+				b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+				b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				b.image = h.images[i].image;
+				b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS };
+				to.push_back(b);
+			}
+			VkCommandBuffer cmd = h.slots[0].cmd;
+			VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+			begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+			if (!to.empty() && vkBeginCommandBuffer(cmd, &begin) == VK_SUCCESS) {
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, (uint32_t)to.size(), to.data());
+				if (vkEndCommandBuffer(cmd) == VK_SUCCESS) {
+					VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+					submit.commandBufferCount = 1;
+					submit.pCommandBuffers = &cmd;
+					if (vkQueueSubmit(h.vk.queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS) vkQueueWaitIdle(h.vk.queue);
+				}
+				vkResetCommandBuffer(cmd, 0);
+			}
+		}
+		// (2026-11-07 ptaaa-omm, protocol 9) VK_EXT_opacity_micromap: the hardware's reading of a known micromap checked once, before any
+		// frame (NvrRtOmm.inl SelfTest); without the extension nothing happens (the shaders' alpha test as before)
+		if (h.vk.omm) Omm::SelfTest(h);
+		shared->ommState = NVR_RT_OMM_STATE_OFF;
+		shared->ommFlags = (h.vk.omm ? NVR_RT_OMM_FLAG_EXTENSION : 0u) | (Omm::g_omm.hwOk ? NVR_RT_OMM_FLAG_HW_TESTED : 0u);
+		Status("ready: ray tracing on %s, the game's GPU (found by %s; %u shared images, arena %ux%u; opacity micromaps: %s)", h.vk.properties.deviceName, h.vk.matchedBy,
+			h.imageCount, arena.width, arena.height, !h.vk.omm ? "no (no VK_EXT_opacity_micromap)" : Omm::g_omm.hwOk ? "yes (self-test passed)" : "no (self-test failed)");
 		SetState(NVR_RT_STATE_READY);
+		PipelineCacheSave(h.vk.device, "after the start's pipelines");	// (2026-11-09; the game may stop the helper without a word later)
 
+		// (2026-11-07 rt-shutdown) every way out of this loop goes through ShutdownDrain (above): the frames published but not run get their
+		// outputReady signal, the GPU goes idle, then the process exits. quit and the game's death are checked between frames too.
 		uint64_t next = 1;
 		bool parentGone = false;
-		for (;;) {
+		const char* why = nullptr;
+		while (!why) {
 			HANDLE waits[2] = { frameEvent, parent };
 			const DWORD w = WaitForMultipleObjects(2, waits, FALSE, 250);
-			if (w == WAIT_OBJECT_0 + 1) { Log("the game exited"); parentGone = true; break; }
-			if (shared->quit) {
-				Log("NVR asked the helper to exit");
-				if (next > 1) {
-					const uint64_t last = next - 1;
-					VkSemaphoreWaitInfo wait = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-					wait.semaphoreCount = 1;
-					wait.pSemaphores = &h.outputReady;
-					wait.pValues = &last;
-					vkWaitSemaphores(h.vk.device, &wait, 2000ull * 1000 * 1000);
-				}
-				break;
-			}
+			if (w == WAIT_OBJECT_0 + 1) { parentGone = true; why = "the game exited"; break; }
+			if (shared->quit) { why = "NVR asked the helper to exit"; break; }
 			for (uint32_t i = 0; i < std::min<uint32_t>((uint32_t)shared->shaderCount, NVR_RT_MAX_SHADERS); i++) Pipeline(h, i);	// shaders registered later
 			const int64_t latest = InterlockedCompareExchange64((volatile LONG64*)&shared->latestFrame, 0, 0);
 			MemoryBarrier();
 			while ((int64_t)next <= latest) {
-				if (!ProcessFrame(h, next, parent)) { Log("stopping at frame %llu", (unsigned long long)next); goto done; }
+				if (WaitForSingleObject(parent, 0) == WAIT_OBJECT_0) { parentGone = true; why = "the game exited (between frames)"; break; }
+				if (shared->quit) { why = "NVR asked the helper to exit (between frames)"; break; }
+				if (!ProcessFrame(h, next, parent)) {	// (that frame was not submitted: ShutdownDrain releases it)
+					parentGone = WaitForSingleObject(parent, 0) == WAIT_OBJECT_0;
+					why = parentGone ? "the game exited (during a frame)" : shared->quit ? "NVR asked the helper to exit (during a frame)" : "a frame failed (the message above)";
+					Log("stopping at frame %llu: %s", (unsigned long long)next, why);
+					break;
+				}
 				next++;
 			}
 		}
-	done:
+		Log("%s", why);
+		ShutdownDrain(h, next, parentGone, why);
 		if (shared->state != NVR_RT_STATE_FAILED) SetState(NVR_RT_STATE_EXITED);
 		Log("exit after %llu frames%s", (unsigned long long)shared->framesSubmitted, parentGone ? " (the game is gone)" : "");
 		if (g_log) fclose(g_log);
@@ -1827,8 +2600,9 @@ namespace {
 			vkEnumerateDeviceExtensionProperties(vk.physical, nullptr, &n, nullptr);
 			std::vector<VkExtensionProperties> exts(n);
 			vkEnumerateDeviceExtensionProperties(vk.physical, nullptr, &n, exts.data());
-			Log("probe: VK_KHR_ray_tracing_position_fetch %s, VK_KHR_ray_tracing_pipeline %s", HasExtension(exts, "VK_KHR_ray_tracing_position_fetch") ? "yes" : "no",
-				HasExtension(exts, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) ? "yes" : "no");
+			Log("probe: VK_KHR_ray_tracing_position_fetch %s, VK_KHR_ray_tracing_pipeline %s, VK_EXT_opacity_micromap %s (%s)", HasExtension(exts, "VK_KHR_ray_tracing_position_fetch") ? "yes" : "no",
+				HasExtension(exts, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) ? "yes" : "no", HasExtension(exts, VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME) ? "yes" : "no",
+				vk.omm ? "usable: alpha-tested geometry can get micromaps" : "not usable here: the shaders' alpha test as before");
 		}
 		vkDestroyDevice(vk.device, nullptr);
 		vkDestroyInstance(vk.instance, nullptr);
@@ -1841,8 +2615,21 @@ namespace {
 int wmain(int argc, wchar_t** argv) {
 	InitializeCriticalSection(&g_logLock);
 	g_exeDir = ExeDir();
+	const wchar_t* logName = nullptr;	// (2026-11-07 rt-shutdown) --log <file name> (next to the exe): a second helper's own log (the RT test host)
+	for (int i = 1; i + 1 < argc; i++) if (!wcscmp(argv[i], L"--log")) logName = argv[i + 1];
+	for (int i = 1; i + 1 < argc; i++) if (!wcscmp(argv[i], L"--wait")) g_cpuWait = !wcscmp(argv[i + 1], L"cpu");	// UNOFFICIAL 2026-11-10
+	for (int i = 1; i + 1 < argc; i++) if (!wcscmp(argv[i], L"--gpu-priority")) g_highPriority = !wcscmp(argv[i + 1], L"high");
+	for (int i = 1; i < argc; i++) if (!wcscmp(argv[i], L"--measure")) g_measure = true;
+	for (int i = 1; i + 1 < argc; i++) if (!wcscmp(argv[i], L"--signal")) g_cpuSignal = !wcscmp(argv[i + 1], L"cpu");	// (needs --wait cpu)
+	for (int i = 1; i < argc; i++) if (!wcscmp(argv[i], L"--timer-1ms")) {	// UNOFFICIAL 2026-11-10 (bench): this process's timer resolution 1 ms (per process since Windows 10 2004)
+		typedef UINT(WINAPI* TimeBegin)(UINT);
+		const HMODULE winmm = LoadLibraryW(L"winmm.dll");
+		const TimeBegin begin = winmm ? (TimeBegin)GetProcAddress(winmm, "timeBeginPeriod") : nullptr;
+		g_timerResult = begin ? (int)begin(1) : -1;
+	}
+	for (int i = 1; i < argc; i++) if (!wcscmp(argv[i], L"--serial-pipelines")) g_serialPipelines = true;	// (2026-11-11) as NVR_RT_HELPER_SERIAL: the start's pipelines one after another
 	for (int i = 1; i < argc; i++) {
-		if (!wcscmp(argv[i], L"--shm") && i + 1 < argc) return RunHelper(argv[i + 1]);
+		if (!wcscmp(argv[i], L"--shm") && i + 1 < argc) return RunHelper(argv[i + 1], logName);
 		if (!wcscmp(argv[i], L"--probe")) return RunProbe();
 		if (!wcscmp(argv[i], L"--replay")) return RunReplay(argc, argv);
 	}

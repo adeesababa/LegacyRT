@@ -55,11 +55,13 @@ tracing to work *with* the original renderer rather than in place of it.
 
 ## What is in here
 
+Last synced with Vegas Shaders on 2026-11-13 (its development build after 1.0.8; helper protocol version 9). The sync is done by hand, so this repository can trail Vegas Shaders by days.
+
 | Folder | What |
 |---|---|
 | `helper/` | `NvrRtHelper.exe` (64-bit, C++, Vulkan): the scene, acceleration structures, pass dispatch, frame capture and offline `--replay`. `NvrRtProtocol.h` is the shared-memory contract both sides include. |
-| `shaders/` | The trace passes (GLSL with `GL_EXT_ray_query`): sun shadows, lamp shadows (incl. many-lights / ReSTIR variants), flashlight shadows, AO + GI + a radiance cache, reflections, a reference path tracer with light grid, ReSTIR GI and denoiser inputs. `compile.sh` builds them. |
-| `dxvk/` | The DXVK changes as a `git am` patch series on DXVK v3.0.1, and `build.sh` (Linux / WSL, MinGW). The series also holds the extension's non-RT parts (compute and full-screen passes, HDR output, tessellation, DLSS image sharing) that the game side uses. The RT-specific patches are 0026 (shared images and timeline semaphores), 0028, 0029, 0033, 0034. |
+| `shaders/` | The trace passes (GLSL with `GL_EXT_ray_query`): sun shadows, lamp shadows (incl. many-lights / ReSTIR variants), flashlight shadows, AO + GI + a radiance cache, reflections, light shafts and lamp haze through traced air, a path tracer with light grid, ReSTIR DI / GI, a radiance cache and denoiser inputs, and a shadow denoiser (its passes, plus an optional port of AMD's FidelityFX shadow denoiser in `ffx/`, MIT, AMD's notice kept there). `common/` holds three small includes shared with the game side. `compile.sh` builds all 48 passes. |
+| `dxvk/` | The DXVK changes as a `git am` patch series on DXVK v3.0.1, and `build.sh` (Linux / WSL, MinGW). The series also holds the extension's non-RT parts (compute and full-screen passes, HDR output, tessellation, DLSS image sharing) that the game side uses. The RT-specific patches are 0026 (shared images and timeline semaphores), 0028, 0029, 0033, 0034, 0035 (block-compressed shared images, so real textures reach the tracer without decoding). |
 
 **Not in here:** the feeder for Fallout: New Vegas. It lives inside Vegas Shaders (GPL v3, see that repository's
 `src/core/Rt*.cpp` and the RT effects) because it is built on that mod's framework. It is the reference for writing a feeder
@@ -82,7 +84,7 @@ Requirements at run time: a GPU with Vulkan ray queries (RTX 20xx+, RX 6000+, re
 ## Build
 
 - **Helper:** `helper/NvrRtHelper.vcxproj` (Visual Studio 2022, x64). Needs the Vulkan SDK (`%VULKAN_SDK%`).
-- **Shaders:** `shaders/compile.sh` (Vulkan SDK's `glslangValidator` and `spirv-val`).
+- **Shaders:** `shaders/compile.sh` (Vulkan SDK's `glslangValidator` and `spirv-val`; `dxc` for the four optional FidelityFX passes).
 - **DXVK:** `dxvk/build.sh` on Linux or WSL (see its header for packages). Produces the 32-bit `d3d9.dll`.
 
 ## Contributors
